@@ -49,22 +49,13 @@ When both are connected, Claude will search all of them automatically for matchi
 1. Log in to FreeAgent → **Settings → Developer API**.
 2. Create an OAuth application. Set the redirect URI to `http://localhost:8080/callback`.
 3. Note your **Client ID** and **Client Secret**.
-4. Do a one-time OAuth flow to get a **refresh token**:
+4. Run the bundled auth command to complete the OAuth flow and save a refresh token to `.mcp.json` automatically:
 
 ```bash
-# Open this URL in your browser (substitute your client_id)
-open "https://api.freeagent.com/v2/approve_app?client_id=YOUR_CLIENT_ID&response_type=code&redirect_uri=http://localhost:8080/callback"
-
-# After approving, exchange the ?code= for tokens:
-curl -X POST https://api.freeagent.com/v2/token_endpoint \
-  -d "grant_type=authorization_code" \
-  -d "client_id=YOUR_CLIENT_ID" \
-  -d "client_secret=YOUR_CLIENT_SECRET" \
-  -d "redirect_uri=http://localhost:8080/callback" \
-  -d "code=CODE_FROM_REDIRECT"
+npx freeagent-mcp-server auth
 ```
 
-Save the `refresh_token` from the response — it is long-lived.
+The command prompts for your Client ID and Client Secret, opens the FreeAgent authorization page in your browser, listens for the callback, exchanges the code for a long-lived refresh token, and writes everything to `.mcp.json` in the current directory. If `.mcp.json` already exists, it updates just the `freeagent` entry.
 
 ---
 
@@ -98,8 +89,13 @@ All settings are read from environment variables.
 | `VENDOR_CATEGORIES` | JSON object extending the built-in vendor → category mapping (see below) |
 | `MILEAGE_CATEGORY_URL` | FreeAgent category URL for mileage expenses (default `/v2/categories/311`) |
 | `MILEAGE_RATE_PENCE` | Fixed pence-per-mile rate; overrides HMRC logic when set |
+| `HMRC_RATE_HIGH_PENCE` | HMRC high-band rate in pence (default `45`) |
+| `HMRC_RATE_LOW_PENCE` | HMRC low-band rate in pence (default `25`) |
+| `HMRC_THRESHOLD_MILES` | Miles per tax year before the low band kicks in (default `10000`) |
 | `ORS_API_KEY` | [OpenRouteService](https://openrouteservice.org) API key for drive-distance lookups |
 | `GOOGLE_MAPS_API_KEY` | Google Maps API key for drive-distance lookups (alternative to ORS) |
+| `PORT` | If set, serves over HTTP on this port instead of stdio |
+| `AUTH_TOKEN` | Bearer token required on every HTTP request. Strongly recommended whenever `PORT` is set |
 
 ### Built-in vendor → category mappings
 
@@ -156,14 +152,18 @@ When `ratePence` and `MILEAGE_RATE_PENCE` are both unset, HMRC approved rates ap
 
 Pass `cumulativeMilesYTD` to enable the threshold crossover calculation.
 
+HMRC has adjusted these rates historically. If they change again, override without editing source by setting `HMRC_RATE_HIGH_PENCE`, `HMRC_RATE_LOW_PENCE`, and/or `HMRC_THRESHOLD_MILES`.
+
 ---
 
 ## Development
 
 ```bash
-npm run dev   # watch mode (tsx)
-npm run build # compile TypeScript → dist/
-npm start     # run compiled server
+npm run dev        # watch mode (tsx)
+npm run build      # compile TypeScript → dist/
+npm start          # run compiled server
+npm test           # run unit tests once
+npm run test:watch # watch mode for tests
 ```
 
 ---
@@ -195,8 +195,10 @@ Create `.mcp.json` in your project directory (or `~/.mcp.json` for global access
 Set `PORT` to run as an HTTP server (for webhooks, iPhone Shortcuts, Power Automate):
 
 ```bash
-PORT=3000 node dist/index.js
+PORT=3000 AUTH_TOKEN=a-long-random-string node dist/index.js
 ```
+
+Always set `AUTH_TOKEN` when exposing HTTP mode — every request must include `Authorization: Bearer <AUTH_TOKEN>` or it is rejected with 401. Without `AUTH_TOKEN` the server starts anyway but prints a warning to stderr and accepts all requests; only do that on a trusted loopback interface.
 
 ---
 

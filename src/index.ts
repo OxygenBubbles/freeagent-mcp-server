@@ -21,19 +21,40 @@
  *
  * Optional:
  *   VENDOR_CATEGORIES         – JSON: vendor name → FreeAgent category URL
- *   MILEAGE_RATE_PENCE        – Default pence-per-mile rate
+ *   MILEAGE_RATE_PENCE        – Flat pence-per-mile rate (overrides HMRC rates)
  *   MILEAGE_CATEGORY_URL      – FreeAgent category URL for mileage
+ *   HMRC_RATE_HIGH_PENCE      – HMRC high rate in pence (default 45)
+ *   HMRC_RATE_LOW_PENCE       – HMRC low rate in pence (default 25)
+ *   HMRC_THRESHOLD_MILES      – HMRC threshold miles per tax year (default 10000)
  *   ORS_API_KEY               – OpenRouteService key (mileage distance calc)
  *   GOOGLE_MAPS_API_KEY       – Google Maps key (alternative to ORS)
  *   PORT                      – HTTP mode port (e.g. 3000)
+ *   AUTH_TOKEN                – Bearer token required in HTTP mode (recommended)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { randomBytes } from "crypto";
 import { registerAccountTools } from "./tools/accounts.js";
 import { registerTransactionTools } from "./tools/transactions.js";
 import { registerExpenseTools } from "./tools/expenses.js";
 import { registerMileageTools } from "./tools/mileage.js";
+
+// ── CLI subcommand dispatch ──────────────────────────────────────────────────
+// `freeagent-mcp-server auth` runs the OAuth setup flow. Any other invocation
+// starts the MCP server as normal.
+if (process.argv[2] === "auth") {
+  const { runAuth } = await import("./auth.js");
+  try {
+    await runAuth();
+    process.exit(0);
+  } catch (err) {
+    process.stderr.write(
+      `\nError: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    process.exit(1);
+  }
+}
 
 const server = new McpServer(
   {
@@ -83,11 +104,26 @@ async function main(): Promise<void> {
     );
     const http = await import("http");
 
+    const authToken = process.env.AUTH_TOKEN;
+    if (!authToken) {
+      process.stderr.write(
+        "Warning: AUTH_TOKEN is not set. HTTP mode is unauthenticated — set AUTH_TOKEN to require a bearer token.\n"
+      );
+    }
+
     const httpTransport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => Math.random().toString(36).slice(2),
+      sessionIdGenerator: () => randomBytes(16).toString("hex"),
     });
 
     const httpServer = http.createServer(async (req, res) => {
+      if (authToken) {
+        const authHeader = req.headers.authorization;
+        if (authHeader !== `Bearer ${authToken}`) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+      }
       await httpTransport.handleRequest(req, res);
     });
 
@@ -95,7 +131,7 @@ async function main(): Promise<void> {
 
     httpServer.listen(port, () => {
       process.stderr.write(
-        `FreeAgent MCP server listening on http://localhost:${port}\n`
+        `FreeAgent MCP server listening on http://localhost:${port}${authToken ? " (authenticated)" : " (WARNING: no AUTH_TOKEN)"}\n`
       );
     });
   } else {

@@ -26,12 +26,23 @@ import type {
 
 let cachedToken: FreeAgentToken | null = null;
 let tokenExpiresAt = 0;
+let refreshPromise: Promise<string> | null = null;
 
 async function getAccessToken(): Promise<string> {
   if (cachedToken && Date.now() < tokenExpiresAt - 60_000) {
     return cachedToken.access_token;
   }
 
+  // Prevent concurrent refresh races — share a single in-flight promise.
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = performTokenRefresh().finally(() => {
+    refreshPromise = null;
+  });
+  return refreshPromise;
+}
+
+async function performTokenRefresh(): Promise<string> {
   const clientId = process.env.FREEAGENT_CLIENT_ID;
   const clientSecret = process.env.FREEAGENT_CLIENT_SECRET;
   const refreshToken = process.env.FREEAGENT_REFRESH_TOKEN;
@@ -71,9 +82,13 @@ async function faGet<T>(path: string, params?: Record<string, unknown>): Promise
   return response.data;
 }
 
-async function faPut<T>(path: string, body: unknown): Promise<T> {
+async function faRequest<T>(
+  method: "put" | "post",
+  path: string,
+  body: unknown
+): Promise<T> {
   const token = await getAccessToken();
-  const response = await axios.put<T>(`${FA_API_BASE}${path}`, body, {
+  const response = await axios[method]<T>(`${FA_API_BASE}${path}`, body, {
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
@@ -84,23 +99,32 @@ async function faPut<T>(path: string, body: unknown): Promise<T> {
   return response.data;
 }
 
-async function faPost<T>(path: string, body: unknown): Promise<T> {
-  const token = await getAccessToken();
-  const response = await axios.post<T>(`${FA_API_BASE}${path}`, body, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    timeout: 30_000,
-  });
-  return response.data;
+function faPut<T>(path: string, body: unknown): Promise<T> {
+  return faRequest("put", path, body);
+}
+
+function faPost<T>(path: string, body: unknown): Promise<T> {
+  return faRequest("post", path, body);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function extractId(entry: { url: string }): string {
-  return entry.url.split("/").pop() ?? entry.url;
+  const id = entry.url.split("/").filter(Boolean).pop() ?? "";
+  if (!id) {
+    throw new Error(`Could not extract ID from FreeAgent URL: "${entry.url}"`);
+  }
+  return id;
+}
+
+const CATEGORY_PATH_RE = /^\/v2\/categories\/\d+$/;
+
+function validateCategoryPath(path: string): void {
+  if (!CATEGORY_PATH_RE.test(path)) {
+    throw new Error(
+      `Invalid category path "${path}". Expected format: /v2/categories/<id>`
+    );
+  }
 }
 
 // ── Bank accounts ────────────────────────────────────────────────────────────
@@ -160,7 +184,10 @@ export async function updateExplanation(opts: {
 }): Promise<BankTransactionExplanation> {
   const body: Record<string, unknown> = {};
   if (opts.description !== undefined) body["description"] = opts.description;
-  if (opts.category !== undefined) body["category"] = `${FA_API_BASE}${opts.category}`;
+  if (opts.category !== undefined) {
+    validateCategoryPath(opts.category);
+    body["category"] = `${FA_API_BASE}${opts.category}`;
+  }
   if (opts.markExplained) body["marked_for_review"] = false;
 
   const data = await faPut<{ bank_transaction_explanation: BankTransactionExplanation }>(
@@ -217,16 +244,17 @@ export async function uploadAttachment(opts: {
   fileBase64: string;
 }): Promise<Attachment> {
   if (opts.entityType === "bank_transaction_explanation") {
-    // For bank transaction explanations, attach inline via PUT
     const result = await attachToExplanation({
       explanationId: opts.entityId,
       fileName: opts.fileName,
       contentType: opts.contentType,
       fileBase64: opts.fileBase64,
     });
-    // Return a synthetic Attachment from the explanation's attachment field
-    const att = result as unknown as { attachment: Attachment };
-    return att.attachment ?? { url: "", id: "", content_type: opts.contentType, file_name: opts.fileName, file_size: 0 };
+    const resultWithAtt = result as unknown as { attachment?: Attachment };
+    if (!resultWithAtt.attachment) {
+      throw new Error("FreeAgent did not return an attachment after upload.");
+    }
+    return resultWithAtt.attachment;
   }
 
   // Expenses: use PUT /expenses/:id with inline attachment
@@ -269,6 +297,8 @@ export async function createExpense(opts: {
   salesTaxRate?: string;
   manualSalesTaxAmount?: string;
 }): Promise<Expense> {
+  validateCategoryPath(opts.categoryUrl);
+
   const body: Record<string, unknown> = {
     expense: {
       category: `${FA_API_BASE}${opts.categoryUrl}`,
@@ -317,7 +347,7 @@ export function handleFAError(error: unknown): string {
       const status = error.response.status;
       const rawErrors = (error.response.data as { errors?: unknown })?.errors;
       const detail = Array.isArray(rawErrors)
-        ? rawErrors.join(", ")
+        ? rawErrors.map(String).join(", ")
         : rawErrors != null
           ? String(rawErrors)
           : "";

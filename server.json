@@ -1,0 +1,71 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.OxygenBubbles/freeagent-mcp-server",
+  "description": "MCP server for FreeAgent accounting — bank reconciliation, expenses, mileage claims and receipt management. Automates categorising transactions, attaching receipts, creating expense claims and logging business mileage.",
+  "repository": {
+    "url": "https://github.com/OxygenBubbles/freeagent-mcp-server",
+    "source": "github"
+  },
+  "version": "2.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "freeagent-mcp-server",
+      "version": "2.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "FREEAGENT_CLIENT_ID",
+          "description": "FreeAgent OAuth app client ID (from dev.freeagent.com)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "FREEAGENT_CLIENT_SECRET",
+          "description": "FreeAgent OAuth app client secret",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "FREEAGENT_REFRESH_TOKEN",
+          "description": "FreeAgent long-lived OAuth refresh token",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "VENDOR_CATEGORIES",
+          "description": "JSON map of vendor name to FreeAgent category URL (extends built-in mappings)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "MILEAGE_RATE_PENCE",
+          "description": "Default pence-per-mile rate (overrides HMRC 45p/25p)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ORS_API_KEY",
+          "description": "OpenRouteService API key for driving distance calculation",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "GOOGLE_MAPS_API_KEY",
+          "description": "Google Maps API key (alternative to ORS for distance calculation)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

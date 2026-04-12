@@ -8,37 +8,19 @@ import {
   uploadAttachment,
   handleFAError,
 } from "../services/freeagent.js";
-import {
-  DEFAULT_VENDOR_CATEGORIES,
-  DATE_TOLERANCE_DAYS,
-  AMOUNT_TOLERANCE,
-} from "../constants.js";
+import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE } from "../constants.js";
+import { inferContentType } from "../utils/contentType.js";
+import { parseAmount, addDays } from "../utils/amount.js";
+import { lookupCategory } from "../utils/vendorCategories.js";
 
-// ── Vendor → category mapping ────────────────────────────────────────────────
+// Max ~7.5 MB binary when decoded
+const FILE_BASE64_MAX = 10_000_000;
 
-function getVendorCategories(): Record<string, string> {
-  let custom: Record<string, string> = {};
-  try {
-    if (process.env.VENDOR_CATEGORIES) {
-      custom = JSON.parse(process.env.VENDOR_CATEGORIES) as Record<string, string>;
-    }
-  } catch {
-    // ignore malformed JSON
-  }
-  return { ...DEFAULT_VENDOR_CATEGORIES, ...custom };
-}
+// Category path must be /v2/categories/<numeric-id>
+const CATEGORY_PATH_REGEX = /^\/v2\/categories\/\d+$/;
 
-function lookupCategory(vendor: string): string | undefined {
-  const vendorCategories = getVendorCategories();
-  // Exact match first
-  if (vendorCategories[vendor]) return vendorCategories[vendor];
-  // Fuzzy match
-  const upper = vendor.toUpperCase();
-  for (const [pattern, url] of Object.entries(vendorCategories)) {
-    if (upper.includes(pattern.toUpperCase())) return url;
-  }
-  return undefined;
-}
+// Minimum vendor string length for fuzzy bank transaction matching
+const MIN_VENDOR_MATCH_LEN = 3;
 
 // ── Tool registration ────────────────────────────────────────────────────────
 
@@ -99,6 +81,7 @@ export function registerExpenseTools(server: McpServer): void {
           vendor: z
             .string()
             .min(1)
+            .max(200)
             .describe("Vendor / merchant name (e.g. 'IONOS Cloud')"),
           datedOn: z
             .string()
@@ -107,10 +90,15 @@ export function registerExpenseTools(server: McpServer): void {
           grossAmount: z
             .string()
             .min(1)
+            .refine(
+              (val) => Number.isFinite(parseFloat(val)) && parseFloat(val) > 0,
+              "Must be a valid positive number (e.g. '22.80')"
+            )
             .describe("Gross amount as string (e.g. '22.80')"),
           description: z
             .string()
             .min(1)
+            .max(1000)
             .describe("Expense description (e.g. 'Monthly cloud hosting')"),
           currency: z
             .string()
@@ -123,10 +111,12 @@ export function registerExpenseTools(server: McpServer): void {
             .describe("VAT amount as string (e.g. '3.80')"),
           categoryUrl: z
             .string()
+            .regex(CATEGORY_PATH_REGEX, "Must be a FreeAgent category path like /v2/categories/285")
             .optional()
             .describe("FreeAgent category URL (e.g. '/v2/categories/285'). Auto-selected from vendor if omitted."),
           fileBase64: z
             .string()
+            .max(FILE_BASE64_MAX, "File must be under ~7.5 MB (10 MB base64)")
             .optional()
             .describe("Base64-encoded receipt file (PDF, PNG, JPEG, etc.)"),
           fileName: z
@@ -155,7 +145,7 @@ export function registerExpenseTools(server: McpServer): void {
     async (args) => {
       try {
         // Resolve category
-        let categoryUrl = args.categoryUrl ?? lookupCategory(args.vendor);
+        const categoryUrl = args.categoryUrl ?? lookupCategory(args.vendor);
         if (!categoryUrl) {
           return {
             content: [
@@ -205,25 +195,27 @@ export function registerExpenseTools(server: McpServer): void {
         // Auto-match bank transaction if requested
         let matchedEntryId: string | null = null;
         if (args.bankAccountId) {
-          const fromDate = new Date(args.datedOn);
-          fromDate.setDate(fromDate.getDate() - DATE_TOLERANCE_DAYS);
-          const toDate = new Date(args.datedOn);
-          toDate.setDate(toDate.getDate() + DATE_TOLERANCE_DAYS);
+          const fromDate = addDays(args.datedOn, -DATE_TOLERANCE_DAYS);
+          const toDate = addDays(args.datedOn, DATE_TOLERANCE_DAYS);
 
           const transactions = await listBankTransactions({
             bankAccountId: args.bankAccountId,
             view: "unexplained",
-            fromDate: fromDate.toISOString().split("T")[0],
-            toDate: toDate.toISOString().split("T")[0],
+            fromDate,
+            toDate,
             limit: 100,
           });
 
-          const amount = Math.abs(parseFloat(args.grossAmount));
+          const amount = parseAmount(args.grossAmount, "grossAmount");
           const upperVendor = args.vendor.toUpperCase();
+
           const match = transactions.find((t) => {
-            const amountMatch =
-              Math.abs(Math.abs(parseFloat(t.amount)) - amount) <= AMOUNT_TOLERANCE;
-            const descMatch = t.description.toUpperCase().includes(upperVendor);
+            const txAmount = parseFloat(t.amount);
+            if (!Number.isFinite(txAmount)) return false;
+            const amountMatch = Math.abs(Math.abs(txAmount) - amount) <= AMOUNT_TOLERANCE;
+            const descMatch =
+              upperVendor.length >= MIN_VENDOR_MATCH_LEN &&
+              t.description.toUpperCase().includes(upperVendor);
             return amountMatch && descMatch;
           });
 
@@ -273,19 +265,4 @@ export function registerExpenseTools(server: McpServer): void {
       }
     }
   );
-}
-
-// ── Content type inference ────────────────────────────────────────────────────
-
-function inferContentType(fileName: string): string {
-  const ext = fileName.toLowerCase().split(".").pop();
-  switch (ext) {
-    case "pdf": return "application/pdf";
-    case "png": return "image/png";
-    case "jpg": case "jpeg": return "image/jpeg";
-    case "gif": return "image/gif";
-    case "webp": return "image/webp";
-    case "heic": return "image/heic";
-    default: return "application/octet-stream";
-  }
 }
