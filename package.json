@@ -1,6 +1,7 @@
 {
   "name": "@oxygenbubbles/freeagent-mcp-server",
   "version": "2.1.0",
+  "mcpName": "io.github.OxygenBubbles/freeagent-mcp-server",
   "publishConfig": {
     "access": "public"
   },
