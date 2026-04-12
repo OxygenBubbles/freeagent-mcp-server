@@ -1,7 +1,7 @@
 {
   "name": "freeagent-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server for FreeAgent bank reconciliation — fetch unexplained transactions, match receipts via M365 Outlook, attach and approve",
+  "version": "2.0.0",
+  "description": "MCP server for FreeAgent accounting — bank reconciliation, expenses, mileage claims and receipt management",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -11,7 +11,8 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "engines": {
     "node": ">=18"
@@ -21,7 +22,22 @@
     "freeagent",
     "accounting",
     "bank-reconciliation",
-    "m365"
+    "expenses",
+    "mileage",
+    "bookkeeping",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "author": "Oxygen Bubbles Limited",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OxygenBubbles/freeagent-mcp-server.git"
+  },
+  "homepage": "https://github.com/OxygenBubbles/freeagent-mcp-server#readme",
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",

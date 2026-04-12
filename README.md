@@ -71,7 +71,7 @@ Save the `refresh_token` from the response — it is long-lived.
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/freeagent-mcp-server.git
+git clone https://github.com/OxygenBubbles/freeagent-mcp-server.git
 cd freeagent-mcp-server
 npm install
 npm run build
@@ -165,6 +165,48 @@ npm run dev   # watch mode (tsx)
 npm run build # compile TypeScript → dist/
 npm start     # run compiled server
 ```
+
+---
+
+## Claude Code setup
+
+Create `.mcp.json` in your project directory (or `~/.mcp.json` for global access):
+
+```json
+{
+  "mcpServers": {
+    "freeagent": {
+      "command": "node",
+      "args": ["/path/to/freeagent-mcp-server/dist/index.js"],
+      "env": {
+        "FREEAGENT_CLIENT_ID": "...",
+        "FREEAGENT_CLIENT_SECRET": "...",
+        "FREEAGENT_REFRESH_TOKEN": "..."
+      }
+    }
+  }
+}
+```
+
+---
+
+## HTTP mode
+
+Set `PORT` to run as an HTTP server (for webhooks, iPhone Shortcuts, Power Automate):
+
+```bash
+PORT=3000 node dist/index.js
+```
+
+---
+
+## Security
+
+- Credentials are environment variables, never in code
+- FreeAgent tokens are cached in memory and refreshed automatically
+- Transactions are never approved without a confirmed receipt or explicit instruction
+- The server never creates new categories — only selects from existing ones
+- `.mcp.json` is excluded from git via `.gitignore`
 
 ---
 
