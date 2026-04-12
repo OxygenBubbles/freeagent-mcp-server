@@ -59,7 +59,7 @@ if (process.argv[2] === "auth") {
 const server = new McpServer(
   {
     name: "freeagent-mcp-server",
-    version: "2.0.0",
+    version: "2.1.0",
   },
   {
     instructions: `
