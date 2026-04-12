@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.OxygenBubbles/freeagent-mcp-server",
-  "description": "MCP server for FreeAgent accounting — bank reconciliation, expenses, mileage claims and receipt management. Automates categorising transactions, attaching receipts, creating expense claims and logging business mileage.",
+  "description": "FreeAgent accounting MCP: bank reconciliation, expenses, mileage claims and receipts.",
   "repository": {
     "url": "https://github.com/OxygenBubbles/freeagent-mcp-server",
     "source": "github"
