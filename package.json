@@ -1,0 +1,36 @@
+{
+  "name": "freeagent-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for FreeAgent bank reconciliation — fetch unexplained transactions, match receipts via M365 Outlook, attach and approve",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "freeagent-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "freeagent",
+    "accounting",
+    "bank-reconciliation",
+    "m365"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "axios": "^1.7.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
