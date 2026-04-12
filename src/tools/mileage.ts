@@ -6,6 +6,10 @@ import {
   isDistanceConfigured,
 } from "../services/distance.js";
 import {
+  calculateHMRCMileage,
+  type HMRCRates,
+} from "../utils/mileageCalc.js";
+import {
   HMRC_RATE_HIGH_PENCE,
   HMRC_RATE_LOW_PENCE,
   HMRC_THRESHOLD_MILES,
@@ -24,6 +28,27 @@ function getDefaultRate(): number | null {
   return null;
 }
 
+function readPositiveEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    process.stderr.write(
+      `Warning: ${name}="${raw}" is not a valid positive number; using default ${fallback}.\n`
+    );
+    return fallback;
+  }
+  return n;
+}
+
+function getHMRCRates(): HMRCRates {
+  return {
+    highPence:      readPositiveEnv("HMRC_RATE_HIGH_PENCE", HMRC_RATE_HIGH_PENCE),
+    lowPence:       readPositiveEnv("HMRC_RATE_LOW_PENCE",  HMRC_RATE_LOW_PENCE),
+    thresholdMiles: readPositiveEnv("HMRC_THRESHOLD_MILES", HMRC_THRESHOLD_MILES),
+  };
+}
+
 export function registerMileageTools(server: McpServer): void {
   server.registerTool(
     "freeagent_create_mileage_expense",
@@ -34,7 +59,8 @@ export function registerMileageTools(server: McpServer): void {
         "or manualMiles for the journey distance. Set roundTrip=true to double the distance.\n\n" +
         "Rate: pass ratePence to set the per-mile rate explicitly (e.g. 45 for 45p/mile). " +
         "If omitted, defaults to the MILEAGE_RATE_PENCE env var, or HMRC approved rates " +
-        "(45p first 10,000 miles, 25p thereafter — pass cumulativeMilesYTD to enable threshold logic).",
+        "(configurable via HMRC_RATE_HIGH_PENCE / HMRC_RATE_LOW_PENCE / HMRC_THRESHOLD_MILES env vars, " +
+        "defaulting to 45p/25p at 10,000 miles — pass cumulativeMilesYTD to enable threshold logic).",
       inputSchema: z
         .object({
           datedOn: z
@@ -44,13 +70,16 @@ export function registerMileageTools(server: McpServer): void {
           description: z
             .string()
             .min(1)
+            .max(500)
             .describe("Journey description (e.g. 'Wakefield to Ackworth TT Club, coaching session')"),
           origin: z
             .string()
+            .max(500)
             .optional()
             .describe("Origin address. Requires distance API key. Omit if providing manualMiles."),
           destination: z
             .string()
+            .max(500)
             .optional()
             .describe("Destination address. Requires distance API key. Omit if providing manualMiles."),
           manualMiles: z
@@ -68,7 +97,7 @@ export function registerMileageTools(server: McpServer): void {
             .optional()
             .describe(
               "Pence per mile (e.g. 45). If omitted, uses MILEAGE_RATE_PENCE env var " +
-              "or HMRC rates (45p/25p with threshold logic if cumulativeMilesYTD provided)."
+              "or HMRC rates (configurable via env vars, defaults to 45p/25p with threshold logic)."
             ),
           cumulativeMilesYTD: z
             .number()
@@ -76,7 +105,7 @@ export function registerMileageTools(server: McpServer): void {
             .optional()
             .describe(
               "Cumulative business miles already claimed this tax year. " +
-              "Used for HMRC threshold logic (45p→25p at 10,000 miles). " +
+              "Used for HMRC threshold logic (high rate → low rate at threshold). " +
               "Only relevant when ratePence is not set."
             ),
           currency: z
@@ -134,43 +163,37 @@ export function registerMileageTools(server: McpServer): void {
         }
 
         // ── Calculate rate and amount ─────────────────────────────────────
-        let ratePence: number;
+        let amountPounds: string;
         let breakdown: string;
+        let ratePence: number | undefined;
 
         if (args.ratePence) {
           // Explicit rate
           ratePence = args.ratePence;
+          const amountPence = Math.round(miles * ratePence);
+          amountPounds = (amountPence / 100).toFixed(2);
           breakdown = `${miles} miles @ ${ratePence}p/mile`;
         } else {
           const envRate = getDefaultRate();
           if (envRate) {
-            // Env var rate
+            // Env var flat rate
             ratePence = envRate;
+            const amountPence = Math.round(miles * ratePence);
+            amountPounds = (amountPence / 100).toFixed(2);
             breakdown = `${miles} miles @ ${ratePence}p/mile (MILEAGE_RATE_PENCE)`;
           } else {
-            // HMRC threshold logic
+            // HMRC threshold logic — load configurable rates once
+            const rates = getHMRCRates();
             const cumulative = args.cumulativeMilesYTD ?? 0;
-            const remaining45p = Math.max(0, HMRC_THRESHOLD_MILES - cumulative);
+            const calc = calculateHMRCMileage(miles, cumulative, rates);
+            amountPounds = calc.amountPounds;
+            breakdown = calc.breakdown;
 
-            if (remaining45p >= miles) {
-              ratePence = HMRC_RATE_HIGH_PENCE;
-              breakdown = `${miles} miles @ ${HMRC_RATE_HIGH_PENCE}p/mile (HMRC)`;
-            } else if (remaining45p <= 0) {
-              ratePence = HMRC_RATE_LOW_PENCE;
-              breakdown = `${miles} miles @ ${HMRC_RATE_LOW_PENCE}p/mile (HMRC, over ${HMRC_THRESHOLD_MILES.toLocaleString()} threshold)`;
-            } else {
-              // Split across threshold
-              const highMiles = remaining45p;
-              const lowMiles = miles - highMiles;
-              const totalPence = Math.round(
-                highMiles * HMRC_RATE_HIGH_PENCE + lowMiles * HMRC_RATE_LOW_PENCE
-              );
-              const amountPounds = (totalPence / 100).toFixed(2);
-
+            if (calc.type === "split") {
               const expense = await createExpense({
                 categoryUrl: getMileageCategoryUrl(),
                 datedOn: args.datedOn,
-                description: `[MILEAGE] [${miles} miles] ${args.description} — ${journeyDetail}. ${highMiles} mi @ ${HMRC_RATE_HIGH_PENCE}p + ${lowMiles} mi @ ${HMRC_RATE_LOW_PENCE}p (crosses ${HMRC_THRESHOLD_MILES.toLocaleString()}-mile threshold)`,
+                description: `[MILEAGE] [${miles} miles] ${args.description} — ${journeyDetail}. ${calc.highMiles} mi @ ${rates.highPence}p + ${calc.lowMiles} mi @ ${rates.lowPence}p (crosses ${rates.thresholdMiles.toLocaleString()}-mile threshold)`,
                 grossValue: amountPounds,
                 currency: args.currency,
               });
@@ -184,8 +207,8 @@ export function registerMileageTools(server: McpServer): void {
                         success: true,
                         expenseId: expense.id,
                         miles,
-                        amount: `${amountPounds}`,
-                        breakdown: `${highMiles} mi @ ${HMRC_RATE_HIGH_PENCE}p + ${lowMiles} mi @ ${HMRC_RATE_LOW_PENCE}p`,
+                        amount: amountPounds,
+                        breakdown,
                         journey: journeyDetail,
                         cumulativeMilesAfter: cumulative + miles,
                       },
@@ -202,17 +225,18 @@ export function registerMileageTools(server: McpServer): void {
                 },
               };
             }
+
+            if (calc.type === "single") {
+              ratePence = calc.ratePence;
+            }
           }
         }
-
-        const amountPence = Math.round(miles * ratePence);
-        const amountPounds = (amountPence / 100).toFixed(2);
 
         const expense = await createExpense({
           categoryUrl: getMileageCategoryUrl(),
           datedOn: args.datedOn,
-          description: `[MILEAGE] [${miles} miles] ${args.description} — ${journeyDetail}. ${breakdown}`,
-          grossValue: amountPounds,
+          description: `[MILEAGE] [${miles} miles] ${args.description} — ${journeyDetail}. ${breakdown!}`,
+          grossValue: amountPounds!,
           currency: args.currency,
         });
 

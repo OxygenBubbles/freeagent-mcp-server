@@ -6,6 +6,13 @@ import {
   uploadAttachment,
   handleFAError,
 } from "../services/freeagent.js";
+import { inferContentType } from "../utils/contentType.js";
+
+// Max ~7.5 MB binary when decoded
+const FILE_BASE64_MAX = 10_000_000;
+
+// Category path must be /v2/categories/<numeric-id>
+const CATEGORY_PATH_REGEX = /^\/v2\/categories\/\d+$/;
 
 export function registerTransactionTools(server: McpServer): void {
   // ── List transactions ───────────────────────────────────────────────────
@@ -128,6 +135,7 @@ export function registerTransactionTools(server: McpServer): void {
             .describe("Human-readable description for the transaction (e.g. 'IONOS — Monthly cloud hosting')"),
           category: z
             .string()
+            .regex(CATEGORY_PATH_REGEX, "Must be a FreeAgent category path like /v2/categories/285")
             .optional()
             .describe("FreeAgent category path (e.g. '/v2/categories/285'). Use freeagent_list_categories to find the right one."),
           markExplained: z
@@ -136,6 +144,7 @@ export function registerTransactionTools(server: McpServer): void {
             .describe("Set true to approve/reconcile the transaction. Only do this when evidence is attached or confirmed."),
           fileBase64: z
             .string()
+            .max(FILE_BASE64_MAX, "File must be under ~7.5 MB (10 MB base64)")
             .optional()
             .describe("Base64-encoded file to attach (receipt, invoice, screenshot — PDF, PNG, JPEG, etc.)"),
           fileName: z
@@ -161,8 +170,7 @@ export function registerTransactionTools(server: McpServer): void {
         // 1. Attach file if provided
         let attachmentUrl: string | undefined;
         if (args.fileBase64 && args.fileName) {
-          const ct =
-            args.contentType ?? inferContentType(args.fileName);
+          const ct = args.contentType ?? inferContentType(args.fileName);
           const att = await uploadAttachment({
             entityId: args.explanationId,
             entityType: "bank_transaction_explanation",
@@ -236,30 +244,4 @@ export function registerTransactionTools(server: McpServer): void {
       }
     }
   );
-}
-
-// ── Content type inference ────────────────────────────────────────────────────
-
-function inferContentType(fileName: string): string {
-  const ext = fileName.toLowerCase().split(".").pop();
-  switch (ext) {
-    case "pdf":
-      return "application/pdf";
-    case "png":
-      return "image/png";
-    case "jpg":
-    case "jpeg":
-      return "image/jpeg";
-    case "gif":
-      return "image/gif";
-    case "webp":
-      return "image/webp";
-    case "heic":
-      return "image/heic";
-    case "tiff":
-    case "tif":
-      return "image/tiff";
-    default:
-      return "application/octet-stream";
-  }
 }

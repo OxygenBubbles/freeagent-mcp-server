@@ -1,4 +1,18 @@
 node_modules/
 dist/
+coverage/
 .env
+.env.local
 .mcp.json
+.mcp.json.bak
+
+# User-local design / planning documents
+*.docx
+~$*
+
+# OS / editor cruft
+.DS_Store
+*.log
+*.swp
+.vscode/
+.idea/
