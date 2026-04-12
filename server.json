@@ -10,7 +10,7 @@
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "freeagent-mcp-server",
+      "identifier": "@oxygenbubbles/freeagent-mcp-server",
       "version": "2.1.0",
       "transport": {
         "type": "stdio"
