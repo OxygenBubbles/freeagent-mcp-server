@@ -1,6 +1,9 @@
 {
-  "name": "freeagent-mcp-server",
+  "name": "@oxygenbubbles/freeagent-mcp-server",
   "version": "2.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "MCP server for FreeAgent accounting — bank reconciliation, expenses, mileage claims and receipt management",
   "type": "module",
   "main": "dist/index.js",

@@ -52,7 +52,7 @@ When both are connected, Claude will search all of them automatically for matchi
 4. Run the bundled auth command to complete the OAuth flow and save a refresh token to `.mcp.json` automatically:
 
 ```bash
-npx freeagent-mcp-server auth
+npx @oxygenbubbles/freeagent-mcp-server auth
 ```
 
 The command prompts for your Client ID and Client Secret, opens the FreeAgent authorization page in your browser, listens for the callback, exchanges the code for a long-lived refresh token, and writes everything to `.mcp.json` in the current directory. If `.mcp.json` already exists, it updates just the `freeagent` entry.

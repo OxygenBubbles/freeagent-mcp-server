@@ -212,7 +212,7 @@ function writeMcpConfig(
   const servers: Record<string, McpServerEntry> = config.mcpServers ?? {};
   servers.freeagent = {
     command: "npx",
-    args: ["freeagent-mcp-server"],
+    args: ["@oxygenbubbles/freeagent-mcp-server"],
     env: {
       ...(servers.freeagent?.env ?? {}),
       FREEAGENT_CLIENT_ID: creds.clientId,
