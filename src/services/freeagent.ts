@@ -107,6 +107,14 @@ function faPost<T>(path: string, body: unknown): Promise<T> {
   return faRequest("post", path, body);
 }
 
+async function faDelete(path: string): Promise<void> {
+  const token = await getAccessToken();
+  await axios.delete(`${FA_API_BASE}${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    timeout: 30_000,
+  });
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function extractId(entry: { url: string }): string {
@@ -273,6 +281,48 @@ export async function uploadAttachment(opts: {
     body
   );
   return data.expense.attachment;
+}
+
+/**
+ * Remove the attachment currently on a bank transaction explanation, if any.
+ * FreeAgent rejects overwriting an attachment via PUT, so the old one must be
+ * deleted before attaching a replacement. Returns true if one was removed.
+ */
+export async function deleteExistingAttachment(explanationId: string): Promise<boolean> {
+  const data = await faGet<{
+    bank_transaction_explanation: { attachment?: { url: string } };
+  }>(`/bank_transaction_explanations/${explanationId}`);
+  const att = data.bank_transaction_explanation?.attachment;
+  if (!att?.url) return false;
+  const attId = att.url.split("/").filter(Boolean).pop();
+  await faDelete(`/attachments/${attId}`);
+  return true;
+}
+
+/**
+ * Download a file from a URL and return it base64-encoded, so a receipt PDF
+ * (e.g. a Stripe "Download invoice" link) can be attached without the caller
+ * ever handling the raw bytes. Follows redirects.
+ */
+export async function fetchUrlAsBase64(
+  url: string
+): Promise<{ base64: string; fileName?: string; contentType?: string }> {
+  const resp = await axios.get<ArrayBuffer>(url, {
+    responseType: "arraybuffer",
+    timeout: 60_000,
+    maxRedirects: 5,
+    headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" },
+  });
+  const base64 = Buffer.from(resp.data).toString("base64");
+  let fileName: string | undefined;
+  const cd = resp.headers["content-disposition"];
+  if (typeof cd === "string") {
+    const m = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(cd);
+    if (m) fileName = decodeURIComponent(m[1].replace(/"$/, ""));
+  }
+  const rawCt = resp.headers["content-type"];
+  const contentType = typeof rawCt === "string" ? rawCt.split(";")[0].trim() : undefined;
+  return { base64, fileName, contentType };
 }
 
 // ── Categories ───────────────────────────────────────────────────────────────

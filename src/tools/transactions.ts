@@ -1,9 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import {
   listBankTransactions,
   updateExplanation,
   uploadAttachment,
+  deleteExistingAttachment,
+  fetchUrlAsBase64,
   handleFAError,
 } from "../services/freeagent.js";
 import { inferContentType } from "../utils/contentType.js";
@@ -117,10 +121,11 @@ export function registerTransactionTools(server: McpServer): void {
         "Approve or update a FreeAgent bank transaction explanation. Use this to:\n" +
         "- Approve a 'marked for review' transaction (set markExplained=true)\n" +
         "- Change the category or description of an explanation\n" +
-        "- Attach a receipt/invoice file (pass fileBase64 + fileName)\n" +
+        "- Attach a receipt/invoice — PREFER filePath (a local file) or fileUrl (a download link); the server reads/encodes it. Re-attaching replaces any existing attachment.\n" +
         "Get the explanationId from freeagent_list_transactions (explanation_id field).\n\n" +
         "RECEIPTS: Before asking the user for a file, search connected email tools (Gmail, Outlook/M365) " +
-        "for a matching invoice using vendor name, amount and date. Download the PDF from the email and pass it as fileBase64. " +
+        "for a matching invoice using vendor name, amount and date. Pass a download link as fileUrl, or save the PDF locally and pass filePath. " +
+        "Avoid fileBase64 for anything but tiny files — large inline base64 is unreliable. " +
         "Also check local file sources (Downloads folder, etc.) if the user has mentioned them.\n\n" +
         "SAFETY: Only set markExplained=true when you have a confirmed receipt attached or the user has explicitly approved it.",
       inputSchema: z
@@ -154,7 +159,16 @@ export function registerTransactionTools(server: McpServer): void {
           contentType: z
             .string()
             .optional()
-            .describe("MIME type of the file (e.g. 'application/pdf', 'image/jpeg', 'image/png'). Inferred from fileName if omitted."),
+            .describe("MIME type of the file (e.g. 'application/pdf', 'image/jpeg', 'image/png'). Inferred from fileName/filePath if omitted."),
+          filePath: z
+            .string()
+            .optional()
+            .describe("Absolute path to a local file to attach (e.g. '/Users/you/Downloads/invoice.pdf'). The SERVER reads and base64-encodes it — PREFER THIS over fileBase64, which is unreliable for non-trivial files. fileName defaults to the file's name."),
+          fileUrl: z
+            .string()
+            .url()
+            .optional()
+            .describe("URL of a receipt to download and attach (e.g. a Stripe 'Download invoice' link). The server fetches and encodes it — no need to handle bytes."),
         })
         .strict(),
       annotations: {
@@ -167,19 +181,41 @@ export function registerTransactionTools(server: McpServer): void {
       try {
         const actions: string[] = [];
 
-        // 1. Attach file if provided
+        // 1. Attach file if provided — resolve bytes from filePath / fileUrl / fileBase64.
         let attachmentUrl: string | undefined;
-        if (args.fileBase64 && args.fileName) {
-          const ct = args.contentType ?? inferContentType(args.fileName);
+        let fileBase64 = args.fileBase64;
+        let fileName = args.fileName;
+        let contentType = args.contentType;
+        if (!fileBase64 && args.filePath) {
+          const buf = await readFile(args.filePath);
+          fileBase64 = buf.toString("base64");
+          fileName = fileName ?? basename(args.filePath);
+        }
+        if (!fileBase64 && args.fileUrl) {
+          const fetched = await fetchUrlAsBase64(args.fileUrl);
+          fileBase64 = fetched.base64;
+          fileName = fileName ?? fetched.fileName ?? "attachment.pdf";
+          contentType = contentType ?? fetched.contentType;
+        }
+        if (fileBase64) {
+          if (fileBase64.length > FILE_BASE64_MAX) {
+            throw new Error("File too large to attach (over ~7.5 MB).");
+          }
+          const name = fileName ?? "attachment.pdf";
+          const ct = contentType ?? inferContentType(name);
+          // FreeAgent won't overwrite an existing attachment via PUT — remove it first.
+          const replaced = await deleteExistingAttachment(args.explanationId).catch(() => false);
           const att = await uploadAttachment({
             entityId: args.explanationId,
             entityType: "bank_transaction_explanation",
-            fileName: args.fileName,
+            fileName: name,
             contentType: ct,
-            fileBase64: args.fileBase64,
+            fileBase64,
           });
           attachmentUrl = att.url;
-          actions.push(`Attached ${att.file_name} (${att.file_size} bytes)`);
+          actions.push(
+            `Attached ${att.file_name} (${att.file_size} bytes)${replaced ? " (replaced previous)" : ""}`
+          );
         }
 
         // 2. Update explanation (category, description, approve)
