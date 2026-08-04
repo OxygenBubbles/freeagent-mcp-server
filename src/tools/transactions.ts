@@ -54,9 +54,9 @@ export function registerTransactionTools(server: McpServer): void {
             .number()
             .int()
             .min(1)
-            .max(200)
+            .max(100)
             .default(50)
-            .describe("Max entries to return (default 50, max 200)"),
+            .describe("Max entries to return (default 50, max 100)"),
           page: z
             .number()
             .int()

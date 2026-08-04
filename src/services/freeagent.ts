@@ -21,6 +21,13 @@ import type {
   Expense,
   ExpenseCategory,
   Project,
+  Contact,
+  Invoice,
+  Bill,
+  Task,
+  Timeslip,
+  TrialBalanceEntry,
+  TaxTimelineItem,
 } from "../types.js";
 
 // ── Debug logging ─────────────────────────────────────────────────────────────
@@ -200,30 +207,31 @@ export function toAbsoluteUrl(pathOrUrl: string): string {
   return `${FA_API_BASE}${path.replace(/^\/v2(?=\/)/, "")}`;
 }
 
-const CATEGORY_URL_RE = /^https:\/\/api\.freeagent\.com\/v2\/categories\/\d+$/;
-const PROJECT_URL_RE = /^https:\/\/api\.freeagent\.com\/v2\/projects\/\d+$/;
-
-/** Normalise a category reference to an absolute URL, rejecting anything else. */
-export function resolveCategoryUrl(pathOrUrl: string): string {
-  const url = toAbsoluteUrl(pathOrUrl);
-  if (!CATEGORY_URL_RE.test(url)) {
-    throw new Error(
-      `Invalid category "${pathOrUrl}". Expected /v2/categories/<id> or the full FreeAgent category URL.`
-    );
-  }
-  return url;
+/**
+ * Build a resolver that normalises a reference to an absolute URL for one
+ * FreeAgent collection, rejecting references to anything else. Guards against
+ * both malformed input and passing (say) a project where a category is wanted.
+ */
+function makeUrlResolver(collection: string, label: string) {
+  const re = new RegExp(`^https://api\\.freeagent\\.com/v2/${collection}/\\d+$`);
+  return (pathOrUrl: string): string => {
+    const url = toAbsoluteUrl(pathOrUrl);
+    if (!re.test(url)) {
+      throw new Error(
+        `Invalid ${label} "${pathOrUrl}". Expected /v2/${collection}/<id> or the full FreeAgent ${label} URL.`
+      );
+    }
+    return url;
+  };
 }
 
-/** Normalise a project reference to an absolute URL, rejecting anything else. */
-export function resolveProjectUrl(pathOrUrl: string): string {
-  const url = toAbsoluteUrl(pathOrUrl);
-  if (!PROJECT_URL_RE.test(url)) {
-    throw new Error(
-      `Invalid project "${pathOrUrl}". Expected /v2/projects/<id> or the full FreeAgent project URL.`
-    );
-  }
-  return url;
-}
+export const resolveCategoryUrl = makeUrlResolver("categories", "category");
+export const resolveProjectUrl = makeUrlResolver("projects", "project");
+export const resolveContactUrl = makeUrlResolver("contacts", "contact");
+export const resolveTaskUrl = makeUrlResolver("tasks", "task");
+export const resolveUserUrl = makeUrlResolver("users", "user");
+export const resolveInvoiceUrl = makeUrlResolver("invoices", "invoice");
+export const resolveBillUrl = makeUrlResolver("bills", "bill");
 
 /**
  * Expense claims are recorded from the claimant's point of view: a negative
@@ -670,6 +678,497 @@ export async function linkExpenseToEntry(opts: {
   );
   const explanation = data.bank_transaction_explanation;
   return { ...explanation, id: extractId(explanation) };
+}
+
+// ── Contacts ─────────────────────────────────────────────────────────────────
+
+export async function listContacts(opts: {
+  view?: "all" | "active" | "clients" | "suppliers" | "hidden";
+  limit?: number;
+  page?: number;
+} = {}): Promise<Contact[]> {
+  const params: Record<string, unknown> = {
+    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+    page: opts.page ?? 1,
+  };
+  if (opts.view && opts.view !== "all") params["view"] = opts.view;
+  const data = await faGet<{ contacts: Contact[] }>("/contacts", params);
+  return (data.contacts ?? []).map((c) => ({ ...c, id: extractId(c) }));
+}
+
+export interface ContactInput {
+  organisationName?: string;
+  firstName?: string;
+  lastName?: string;
+  email?: string;
+  phoneNumber?: string;
+  address1?: string;
+  address2?: string;
+  town?: string;
+  region?: string;
+  postcode?: string;
+  country?: string;
+  contactNameOnInvoices?: boolean;
+  chargeSalesTax?: "Auto" | "Always" | "Never";
+}
+
+export function buildContactBody(opts: ContactInput): { contact: Record<string, unknown> } {
+  if (!opts.organisationName && !opts.firstName && !opts.lastName) {
+    throw new Error(
+      "A contact needs either an organisation name or a first/last name."
+    );
+  }
+  const contact: Record<string, unknown> = {};
+  const map: Array<[string, unknown]> = [
+    ["organisation_name", opts.organisationName],
+    ["first_name", opts.firstName],
+    ["last_name", opts.lastName],
+    ["email", opts.email],
+    ["phone_number", opts.phoneNumber],
+    ["address1", opts.address1],
+    ["address2", opts.address2],
+    ["town", opts.town],
+    ["region", opts.region],
+    ["postcode", opts.postcode],
+    ["country", opts.country],
+    ["charge_sales_tax", opts.chargeSalesTax],
+  ];
+  for (const [key, value] of map) {
+    if (value !== undefined && value !== "") contact[key] = value;
+  }
+  // Show the organisation on invoices unless the caller says otherwise.
+  if (opts.contactNameOnInvoices !== undefined) {
+    contact["contact_name_on_invoices"] = opts.contactNameOnInvoices;
+  }
+  return { contact };
+}
+
+export async function createContact(opts: ContactInput): Promise<Contact> {
+  const data = await faPost<{ contact: Contact }>("/contacts", buildContactBody(opts));
+  return { ...data.contact, id: extractId(data.contact) };
+}
+
+// ── Invoices ─────────────────────────────────────────────────────────────────
+
+export type InvoiceView =
+  | "all"
+  | "recent_open_or_overdue"
+  | "open"
+  | "overdue"
+  | "open_or_overdue"
+  | "draft"
+  | "paid";
+
+export async function listInvoices(opts: {
+  view?: InvoiceView;
+  contactUrl?: string;
+  projectUrl?: string;
+  fromDate?: string;
+  toDate?: string;
+  limit?: number;
+  page?: number;
+} = {}): Promise<Invoice[]> {
+  const params: Record<string, unknown> = {
+    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+    page: opts.page ?? 1,
+  };
+  if (opts.view && opts.view !== "all") params["view"] = opts.view;
+  if (opts.contactUrl) params["contact"] = resolveContactUrl(opts.contactUrl);
+  if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.fromDate) params["from_date"] = opts.fromDate;
+  if (opts.toDate) params["to_date"] = opts.toDate;
+
+  const data = await faGet<{ invoices: Invoice[] }>("/invoices", params);
+  return (data.invoices ?? []).map((i) => ({ ...i, id: extractId(i) }));
+}
+
+export async function getInvoice(invoiceId: string): Promise<Invoice> {
+  const data = await faGet<{ invoice: Invoice }>(`/invoices/${invoiceId}`);
+  return { ...data.invoice, id: extractId(data.invoice) };
+}
+
+export interface InvoiceItemInput {
+  description: string;
+  itemType: string;
+  price: string;
+  quantity: string;
+  salesTaxRate?: string;
+  categoryUrl?: string;
+}
+
+export interface InvoiceInput {
+  contactUrl: string;
+  datedOn: string;
+  paymentTermsInDays: number;
+  items: InvoiceItemInput[];
+  reference?: string;
+  currency?: string;
+  projectUrl?: string;
+  poReference?: string;
+  comments?: string;
+  discountPercent?: string;
+}
+
+export function buildInvoiceBody(opts: InvoiceInput): { invoice: Record<string, unknown> } {
+  if (!opts.items.length) {
+    throw new Error("An invoice needs at least one line item.");
+  }
+  if (!Number.isInteger(opts.paymentTermsInDays) || opts.paymentTermsInDays < 0) {
+    throw new Error(
+      `Invalid payment terms "${opts.paymentTermsInDays}". Expected a whole number of days.`
+    );
+  }
+
+  const invoice: Record<string, unknown> = {
+    contact: resolveContactUrl(opts.contactUrl),
+    dated_on: opts.datedOn,
+    payment_terms_in_days: opts.paymentTermsInDays,
+    invoice_items: opts.items.map((item, index) => {
+      const line: Record<string, unknown> = {
+        position: index + 1,
+        description: item.description,
+        item_type: item.itemType,
+        price: item.price,
+        quantity: item.quantity,
+      };
+      if (item.salesTaxRate !== undefined) line["sales_tax_rate"] = item.salesTaxRate;
+      if (item.categoryUrl) line["category"] = resolveCategoryUrl(item.categoryUrl);
+      return line;
+    }),
+  };
+
+  if (opts.reference) invoice["reference"] = opts.reference;
+  if (opts.currency) invoice["currency"] = opts.currency;
+  if (opts.projectUrl) invoice["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.poReference) invoice["po_reference"] = opts.poReference;
+  if (opts.comments) invoice["comments"] = opts.comments;
+  if (opts.discountPercent) invoice["discount_percent"] = opts.discountPercent;
+
+  return { invoice };
+}
+
+export async function createInvoice(opts: InvoiceInput): Promise<Invoice> {
+  const data = await faPost<{ invoice: Invoice }>("/invoices", buildInvoiceBody(opts));
+  return { ...data.invoice, id: extractId(data.invoice) };
+}
+
+export type InvoiceTransition =
+  | "mark_as_draft"
+  | "mark_as_sent"
+  | "mark_as_scheduled"
+  | "mark_as_cancelled";
+
+/**
+ * Move an invoice between states. These are status changes only — none of
+ * them emails the client.
+ */
+export async function transitionInvoice(
+  invoiceId: string,
+  transition: InvoiceTransition
+): Promise<Invoice> {
+  const data = await faPut<{ invoice: Invoice }>(
+    `/invoices/${invoiceId}/transitions/${transition}`,
+    {}
+  );
+  return { ...data.invoice, id: extractId(data.invoice) };
+}
+
+export async function deleteInvoice(invoiceId: string): Promise<void> {
+  await faDelete(`/invoices/${invoiceId}`);
+}
+
+// ── Bills ────────────────────────────────────────────────────────────────────
+
+export type BillView = "all" | "open" | "overdue" | "open_or_overdue" | "paid" | "recurring";
+
+export async function listBills(opts: {
+  view?: BillView;
+  contactUrl?: string;
+  projectUrl?: string;
+  fromDate?: string;
+  toDate?: string;
+  limit?: number;
+  page?: number;
+} = {}): Promise<Bill[]> {
+  const params: Record<string, unknown> = {
+    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+    page: opts.page ?? 1,
+  };
+  if (opts.view && opts.view !== "all") params["view"] = opts.view;
+  if (opts.contactUrl) params["contact"] = resolveContactUrl(opts.contactUrl);
+  if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.fromDate) params["from_date"] = opts.fromDate;
+  if (opts.toDate) params["to_date"] = opts.toDate;
+
+  const data = await faGet<{ bills: Bill[] }>("/bills", params);
+  return (data.bills ?? []).map((b) => ({ ...b, id: extractId(b) }));
+}
+
+export interface BillItemInput {
+  categoryUrl: string;
+  totalValue: string;
+  description?: string;
+  salesTaxRate?: string;
+}
+
+export interface BillInput {
+  contactUrl: string;
+  reference: string;
+  datedOn: string;
+  dueOn: string;
+  items: BillItemInput[];
+  currency?: string;
+  projectUrl?: string;
+  rebillType?: "cost" | "markup" | "price";
+  rebillFactor?: string;
+  attachment?: ExpenseAttachmentInput;
+}
+
+export function buildBillBody(opts: BillInput): { bill: Record<string, unknown> } {
+  if (!opts.items.length) {
+    throw new Error("A bill needs at least one line item.");
+  }
+  if (opts.items.length > 40) {
+    throw new Error(`A bill accepts at most 40 line items (got ${opts.items.length}).`);
+  }
+
+  const bill: Record<string, unknown> = {
+    contact: resolveContactUrl(opts.contactUrl),
+    reference: opts.reference,
+    dated_on: opts.datedOn,
+    due_on: opts.dueOn,
+    bill_items: opts.items.map((item) => {
+      const line: Record<string, unknown> = {
+        category: resolveCategoryUrl(item.categoryUrl),
+        total_value: item.totalValue,
+      };
+      if (item.description) line["description"] = item.description;
+      if (item.salesTaxRate !== undefined) line["sales_tax_rate"] = item.salesTaxRate;
+      return line;
+    }),
+  };
+
+  if (opts.currency) bill["currency"] = opts.currency;
+  if (opts.projectUrl) bill["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.rebillType) bill["rebill_type"] = opts.rebillType;
+  if (opts.rebillFactor) bill["rebill_factor"] = opts.rebillFactor;
+  if (opts.attachment) {
+    bill["attachment"] = {
+      data: opts.attachment.fileBase64,
+      file_name: opts.attachment.fileName,
+      content_type: normalisePdfContentType(opts.attachment.contentType),
+      description: opts.attachment.description ?? opts.attachment.fileName,
+    };
+  }
+
+  return { bill };
+}
+
+export async function createBill(opts: BillInput): Promise<Bill> {
+  const data = await faPost<{ bill: Bill }>("/bills", buildBillBody(opts));
+  return { ...data.bill, id: extractId(data.bill) };
+}
+
+export async function deleteBill(billId: string): Promise<void> {
+  await faDelete(`/bills/${billId}`);
+}
+
+// ── Project tasks ────────────────────────────────────────────────────────────
+
+export async function listTasks(opts: {
+  projectUrl?: string;
+  view?: "all" | "active" | "completed" | "hidden";
+  limit?: number;
+} = {}): Promise<Task[]> {
+  const params: Record<string, unknown> = {
+    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+  };
+  if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.view && opts.view !== "all") params["view"] = opts.view;
+  const data = await faGet<{ tasks: Task[] }>("/tasks", params);
+  return (data.tasks ?? []).map((t) => ({ ...t, id: extractId(t) }));
+}
+
+export interface TaskInput {
+  projectUrl: string;
+  name: string;
+  isBillable?: boolean;
+  billingRate?: string;
+  billingPeriod?: "hour" | "day";
+  currency?: string;
+  status?: "Active" | "Completed" | "Hidden";
+}
+
+export function buildTaskBody(opts: TaskInput): { task: Record<string, unknown> } {
+  const task: Record<string, unknown> = {
+    project: resolveProjectUrl(opts.projectUrl),
+    name: opts.name,
+  };
+  if (opts.isBillable !== undefined) task["is_billable"] = opts.isBillable;
+  if (opts.billingRate !== undefined) task["billing_rate"] = opts.billingRate;
+  if (opts.billingPeriod) task["billing_period"] = opts.billingPeriod;
+  if (opts.currency) task["currency"] = opts.currency;
+  if (opts.status) task["status"] = opts.status;
+  return { task };
+}
+
+export async function createTask(opts: TaskInput): Promise<Task> {
+  const data = await faPost<{ task: Task }>("/tasks", buildTaskBody(opts));
+  return { ...data.task, id: extractId(data.task) };
+}
+
+// ── Timeslips ────────────────────────────────────────────────────────────────
+
+export async function listTimeslips(opts: {
+  fromDate: string;
+  toDate: string;
+  view?: "all" | "unbilled" | "running";
+  userUrl?: string;
+  projectUrl?: string;
+  taskUrl?: string;
+  limit?: number;
+}): Promise<Timeslip[]> {
+  const params: Record<string, unknown> = {
+    from_date: opts.fromDate,
+    to_date: opts.toDate,
+    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+  };
+  if (opts.view && opts.view !== "all") params["view"] = opts.view;
+  if (opts.userUrl) params["user"] = resolveUserUrl(opts.userUrl);
+  if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.taskUrl) params["task"] = resolveTaskUrl(opts.taskUrl);
+
+  const data = await faGet<{ timeslips: Timeslip[] }>("/timeslips", params);
+  return (data.timeslips ?? []).map((t) => ({ ...t, id: extractId(t) }));
+}
+
+export function buildTimeslipBody(opts: {
+  userUrl: string;
+  projectUrl: string;
+  taskUrl: string;
+  datedOn: string;
+  hours: string;
+  comment?: string;
+}): { timeslip: Record<string, unknown> } {
+  const hours = Number.parseFloat(opts.hours);
+  if (!Number.isFinite(hours) || hours <= 0) {
+    throw new Error(`Invalid hours "${opts.hours}". Expected a positive number like "1.5".`);
+  }
+  const timeslip: Record<string, unknown> = {
+    user: resolveUserUrl(opts.userUrl),
+    project: resolveProjectUrl(opts.projectUrl),
+    task: resolveTaskUrl(opts.taskUrl),
+    dated_on: opts.datedOn,
+    hours: opts.hours,
+  };
+  if (opts.comment) timeslip["comment"] = opts.comment;
+  return { timeslip };
+}
+
+export async function createTimeslip(opts: {
+  projectUrl: string;
+  taskUrl: string;
+  datedOn: string;
+  hours: string;
+  comment?: string;
+  userUrl?: string;
+}): Promise<Timeslip> {
+  const userUrl = opts.userUrl ?? (await getCurrentUserUrl());
+  const body = buildTimeslipBody({ ...opts, userUrl });
+  const data = await faPost<{ timeslip?: Timeslip; timeslips?: Timeslip[] }>(
+    "/timeslips",
+    body
+  );
+  // FreeAgent may answer with either the singular or the plural form.
+  const timeslip = data.timeslip ?? data.timeslips?.[0];
+  if (!timeslip) throw new Error("FreeAgent did not return the created timeslip.");
+  return { ...timeslip, id: extractId(timeslip) };
+}
+
+export async function deleteTimeslip(timeslipId: string): Promise<void> {
+  await faDelete(`/timeslips/${timeslipId}`);
+}
+
+// ── Reports ──────────────────────────────────────────────────────────────────
+
+export async function getCompany(): Promise<Record<string, unknown>> {
+  const data = await faGet<{ company: Record<string, unknown> }>("/company");
+  return data.company;
+}
+
+export async function getProfitAndLoss(opts: {
+  fromDate?: string;
+  toDate?: string;
+} = {}): Promise<Record<string, unknown>> {
+  const params: Record<string, unknown> = {};
+  if (opts.fromDate) params["from_date"] = opts.fromDate;
+  if (opts.toDate) params["to_date"] = opts.toDate;
+  const data = await faGet<{ profit_and_loss_summary: Record<string, unknown> }>(
+    "/accounting/profit_and_loss/summary",
+    params
+  );
+  return data.profit_and_loss_summary;
+}
+
+export async function getTrialBalance(opts: { asAt?: string } = {}): Promise<
+  TrialBalanceEntry[]
+> {
+  const params: Record<string, unknown> = {};
+  if (opts.asAt) params["as_at"] = opts.asAt;
+  const data = await faGet<{ trial_balance_summary: TrialBalanceEntry[] }>(
+    "/accounting/trial_balance/summary",
+    params
+  );
+  return data.trial_balance_summary ?? [];
+}
+
+export async function getTaxTimeline(): Promise<TaxTimelineItem[]> {
+  const data = await faGet<{ timeline_items: TaxTimelineItem[] }>(
+    "/company/tax_timeline"
+  );
+  return data.timeline_items ?? [];
+}
+
+/**
+ * Standard 30/60/90 ageing buckets, computed from the open invoices or bills.
+ * FreeAgent has no aged-debtors endpoint, so this derives them.
+ */
+export function buildAgeingBuckets(
+  entries: Array<{ dueOn?: string; dueValue: string; label: string; reference?: string }>,
+  today: string
+): {
+  buckets: Record<string, { count: number; total: string }>;
+  total: string;
+  items: Array<{ label: string; reference?: string; dueOn?: string; dueValue: string; daysOverdue: number; bucket: string }>;
+} {
+  const bucketNames = ["not_yet_due", "1_30_days", "31_60_days", "61_90_days", "over_90_days"];
+  const buckets: Record<string, { count: number; total: number }> = {};
+  for (const name of bucketNames) buckets[name] = { count: 0, total: 0 };
+
+  const todayMs = Date.parse(`${today}T00:00:00Z`);
+  const items = entries.map((entry) => {
+    const value = Number.parseFloat(entry.dueValue) || 0;
+    const dueMs = entry.dueOn ? Date.parse(`${entry.dueOn}T00:00:00Z`) : NaN;
+    const daysOverdue = Number.isFinite(dueMs)
+      ? Math.floor((todayMs - dueMs) / 86_400_000)
+      : 0;
+    const bucket =
+      daysOverdue <= 0 ? "not_yet_due"
+      : daysOverdue <= 30 ? "1_30_days"
+      : daysOverdue <= 60 ? "31_60_days"
+      : daysOverdue <= 90 ? "61_90_days"
+      : "over_90_days";
+    buckets[bucket]!.count += 1;
+    buckets[bucket]!.total += value;
+    return { ...entry, daysOverdue: Math.max(0, daysOverdue), bucket };
+  });
+
+  const total = items.reduce((sum, i) => sum + (Number.parseFloat(i.dueValue) || 0), 0);
+  const rounded: Record<string, { count: number; total: string }> = {};
+  for (const [name, b] of Object.entries(buckets)) {
+    rounded[name] = { count: b.count, total: b.total.toFixed(2) };
+  }
+  return { buckets: rounded, total: total.toFixed(2), items };
 }
 
 // ── Error helper ──────────────────────────────────────────────────────────────

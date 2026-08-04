@@ -2,9 +2,11 @@
 export const FA_API_BASE = "https://api.freeagent.com/v2";
 export const FA_TOKEN_URL = "https://api.freeagent.com/v2/token_endpoint";
 
-// Response limits
+// Response limits.
+// FreeAgent rejects per_page above 100 with "Records limited to 100 per page",
+// so this is a hard API ceiling, not a preference.
 export const DEFAULT_PAGE_SIZE = 50;
-export const MAX_PAGE_SIZE = 200;
+export const MAX_PAGE_SIZE = 100;
 
 // Bank transaction matching (expense → bank entry)
 export const DATE_TOLERANCE_DAYS = 4;
