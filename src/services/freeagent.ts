@@ -20,7 +20,45 @@ import type {
   Attachment,
   Expense,
   ExpenseCategory,
+  Project,
 } from "../types.js";
+
+// ── Debug logging ─────────────────────────────────────────────────────────────
+
+/**
+ * Set FREEAGENT_DEBUG=1 to log outgoing requests and error responses to stderr.
+ * Bearer tokens, credentials and base64 file payloads are always redacted.
+ */
+function debugEnabled(): boolean {
+  const v = process.env.FREEAGENT_DEBUG;
+  return v === "1" || v === "true";
+}
+
+/** Replace secrets and bulky base64 blobs before anything reaches the log. */
+function redact(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.length > 256 ? `<${value.length} chars omitted>` : value;
+  }
+  if (Array.isArray(value)) return value.map(redact);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (/token|secret|password|authorization|client_id|^data$/i.test(k)) {
+        out[k] = "<redacted>";
+      } else {
+        out[k] = redact(v);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+function debugLog(label: string, payload?: unknown): void {
+  if (!debugEnabled()) return;
+  const suffix = payload === undefined ? "" : ` ${JSON.stringify(redact(payload))}`;
+  process.stderr.write(`[freeagent] ${label}${suffix}\n`);
+}
 
 // ── Token cache ───────────────────────────────────────────────────────────────
 
@@ -74,12 +112,18 @@ async function performTokenRefresh(): Promise<string> {
 
 async function faGet<T>(path: string, params?: Record<string, unknown>): Promise<T> {
   const token = await getAccessToken();
-  const response = await axios.get<T>(`${FA_API_BASE}${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-    params,
-    timeout: 30_000,
-  });
-  return response.data;
+  debugLog(`GET ${path}`, params);
+  try {
+    const response = await axios.get<T>(`${FA_API_BASE}${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      params,
+      timeout: 30_000,
+    });
+    return response.data;
+  } catch (err) {
+    logResponseError(`GET ${path}`, err);
+    throw err;
+  }
 }
 
 async function faRequest<T>(
@@ -88,15 +132,30 @@ async function faRequest<T>(
   body: unknown
 ): Promise<T> {
   const token = await getAccessToken();
-  const response = await axios[method]<T>(`${FA_API_BASE}${path}`, body, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    timeout: 30_000,
-  });
-  return response.data;
+  debugLog(`${method.toUpperCase()} ${path}`, body);
+  try {
+    const response = await axios[method]<T>(`${FA_API_BASE}${path}`, body, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      timeout: 30_000,
+    });
+    return response.data;
+  } catch (err) {
+    logResponseError(`${method.toUpperCase()} ${path}`, err);
+    throw err;
+  }
+}
+
+function logResponseError(label: string, err: unknown): void {
+  if (!debugEnabled()) return;
+  if (err instanceof AxiosError && err.response) {
+    debugLog(`${label} -> ${err.response.status}`, err.response.data);
+  } else {
+    debugLog(`${label} -> ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function faPut<T>(path: string, body: unknown): Promise<T> {
@@ -125,14 +184,58 @@ function extractId(entry: { url: string }): string {
   return id;
 }
 
-const CATEGORY_PATH_RE = /^\/v2\/categories\/\d+$/;
+/**
+ * Turn a FreeAgent resource reference into an absolute API URL.
+ *
+ * Callers may supply either the full URL ("https://api.freeagent.com/v2/…")
+ * or the path form the tool schemas advertise ("/v2/categories/285").
+ * FA_API_BASE already ends in "/v2", so a leading "/v2" on the path must be
+ * dropped — concatenating blindly produced ".../v2/v2/categories/285", which
+ * FreeAgent silently treats as a blank reference ("category can't be blank").
+ */
+export function toAbsoluteUrl(pathOrUrl: string): string {
+  const trimmed = pathOrUrl.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  const path = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return `${FA_API_BASE}${path.replace(/^\/v2(?=\/)/, "")}`;
+}
 
-function validateCategoryPath(path: string): void {
-  if (!CATEGORY_PATH_RE.test(path)) {
+const CATEGORY_URL_RE = /^https:\/\/api\.freeagent\.com\/v2\/categories\/\d+$/;
+const PROJECT_URL_RE = /^https:\/\/api\.freeagent\.com\/v2\/projects\/\d+$/;
+
+/** Normalise a category reference to an absolute URL, rejecting anything else. */
+export function resolveCategoryUrl(pathOrUrl: string): string {
+  const url = toAbsoluteUrl(pathOrUrl);
+  if (!CATEGORY_URL_RE.test(url)) {
     throw new Error(
-      `Invalid category path "${path}". Expected format: /v2/categories/<id>`
+      `Invalid category "${pathOrUrl}". Expected /v2/categories/<id> or the full FreeAgent category URL.`
     );
   }
+  return url;
+}
+
+/** Normalise a project reference to an absolute URL, rejecting anything else. */
+export function resolveProjectUrl(pathOrUrl: string): string {
+  const url = toAbsoluteUrl(pathOrUrl);
+  if (!PROJECT_URL_RE.test(url)) {
+    throw new Error(
+      `Invalid project "${pathOrUrl}". Expected /v2/projects/<id> or the full FreeAgent project URL.`
+    );
+  }
+  return url;
+}
+
+/**
+ * Expense claims are recorded from the claimant's point of view: a negative
+ * gross_value is money owed back to them, a positive value is a refund due
+ * from them. The tools take a positive amount, so flip the sign here.
+ */
+export function toExpenseClaimValue(grossValue: string): string {
+  const n = Number.parseFloat(grossValue);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Invalid gross amount "${grossValue}". Expected a number like "22.80".`);
+  }
+  return n > 0 ? `-${Math.abs(n)}` : String(n);
 }
 
 // ── Bank accounts ────────────────────────────────────────────────────────────
@@ -193,8 +296,7 @@ export async function updateExplanation(opts: {
   const body: Record<string, unknown> = {};
   if (opts.description !== undefined) body["description"] = opts.description;
   if (opts.category !== undefined) {
-    validateCategoryPath(opts.category);
-    body["category"] = `${FA_API_BASE}${opts.category}`;
+    body["category"] = resolveCategoryUrl(opts.category);
   }
   if (opts.markExplained) body["marked_for_review"] = false;
 
@@ -207,6 +309,15 @@ export async function updateExplanation(opts: {
 }
 
 // ── Attachments ──────────────────────────────────────────────────────────────
+
+/**
+ * FreeAgent's documented PDF MIME type is "application/x-pdf". It accepts
+ * "application/pdf" too (and stores both as "application/pdf"), but the
+ * documented value is sent for safety.
+ */
+export function normalisePdfContentType(contentType: string): string {
+  return contentType === "application/pdf" ? "application/x-pdf" : contentType;
+}
 
 /**
  * Attach a file (base64) to a bank transaction explanation by including it
@@ -227,7 +338,7 @@ export async function attachToExplanation(opts: {
       attachment: {
         data: opts.fileBase64,
         file_name: opts.fileName,
-        content_type: opts.contentType === "application/pdf" ? "application/x-pdf" : opts.contentType,
+        content_type: normalisePdfContentType(opts.contentType),
         description: opts.description ?? opts.fileName,
       },
     },
@@ -271,7 +382,7 @@ export async function uploadAttachment(opts: {
       attachment: {
         data: opts.fileBase64,
         file_name: opts.fileName,
-        content_type: opts.contentType === "application/pdf" ? "application/x-pdf" : opts.contentType,
+        content_type: normalisePdfContentType(opts.contentType),
         description: opts.fileName,
       },
     },
@@ -329,14 +440,130 @@ export async function fetchUrlAsBase64(
 
 let cachedCategories: ExpenseCategory[] | null = null;
 
+/**
+ * GET /v2/categories does not return a flat "categories" array — it returns
+ * four parallel arrays, one per category type. Reading `data.categories`
+ * always yielded an empty list.
+ */
+const CATEGORY_GROUP_KEYS = [
+  "admin_expenses_categories",
+  "cost_of_sales_categories",
+  "income_categories",
+  "general_categories",
+] as const;
+
 export async function listCategories(): Promise<ExpenseCategory[]> {
   if (cachedCategories) return cachedCategories;
-  const data = await faGet<{ categories: ExpenseCategory[] }>("/categories");
-  cachedCategories = data.categories ?? [];
+  const data = await faGet<Record<string, unknown>>("/categories");
+
+  const flattened: ExpenseCategory[] = [];
+  for (const key of CATEGORY_GROUP_KEYS) {
+    const group = data[key];
+    if (!Array.isArray(group)) continue;
+    for (const raw of group as ExpenseCategory[]) {
+      flattened.push({ ...raw, category_type: key });
+    }
+  }
+
+  // Tolerate a flat "categories" array in case FreeAgent ever returns one.
+  if (flattened.length === 0 && Array.isArray(data["categories"])) {
+    flattened.push(...(data["categories"] as ExpenseCategory[]));
+  }
+
+  cachedCategories = flattened;
   return cachedCategories;
 }
 
+/** Exported for tests — clears the module-level category cache. */
+export function _resetCategoryCache(): void {
+  cachedCategories = null;
+}
+
+// ── Users ────────────────────────────────────────────────────────────────────
+
+let cachedUserUrl: string | null = null;
+
+/**
+ * The URL of the authenticated user. FreeAgent requires `user` on every
+ * expense — omitting it is rejected with "user can't be blank".
+ */
+export async function getCurrentUserUrl(): Promise<string> {
+  if (cachedUserUrl) return cachedUserUrl;
+  const data = await faGet<{ user?: { url?: string } }>("/users/me");
+  const url = data.user?.url;
+  if (!url) {
+    throw new Error("FreeAgent did not return a user URL from /users/me.");
+  }
+  cachedUserUrl = url;
+  return url;
+}
+
+/** Exported for tests — clears the module-level user cache. */
+export function _resetUserCache(): void {
+  cachedUserUrl = null;
+}
+
+// ── Projects ─────────────────────────────────────────────────────────────────
+
+export async function listProjects(view?: "active" | "completed" | "cancelled" | "all"): Promise<Project[]> {
+  const params: Record<string, unknown> = {};
+  if (view && view !== "all") params["view"] = view;
+  const data = await faGet<{ projects: Project[] }>("/projects", params);
+  return (data.projects ?? []).map((p) => ({ ...p, id: extractId(p) }));
+}
+
 // ── Expenses ─────────────────────────────────────────────────────────────────
+
+export interface ExpenseAttachmentInput {
+  fileName: string;
+  contentType: string;
+  fileBase64: string;
+  description?: string;
+}
+
+/**
+ * Build the POST /v2/expenses request body.
+ *
+ * Split out from the request so the documented shape can be unit-tested
+ * without touching the network.
+ */
+export function buildExpenseBody(opts: {
+  categoryUrl: string;
+  datedOn: string;
+  description: string;
+  grossValue: string;
+  userUrl: string;
+  currency?: string;
+  salesTaxRate?: string;
+  manualSalesTaxAmount?: string;
+  projectUrl?: string;
+  attachment?: ExpenseAttachmentInput;
+}): { expense: Record<string, unknown> } {
+  const expense: Record<string, unknown> = {
+    user: opts.userUrl,
+    category: resolveCategoryUrl(opts.categoryUrl),
+    dated_on: opts.datedOn,
+    description: opts.description,
+    gross_value: toExpenseClaimValue(opts.grossValue),
+    currency: opts.currency ?? "GBP",
+  };
+
+  if (opts.salesTaxRate) expense["sales_tax_rate"] = opts.salesTaxRate;
+  if (opts.manualSalesTaxAmount) {
+    expense["manual_sales_tax_amount"] = opts.manualSalesTaxAmount;
+  }
+  if (opts.projectUrl) expense["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.attachment) {
+    expense["attachment"] = {
+      data: opts.attachment.fileBase64,
+      file_name: opts.attachment.fileName,
+      content_type: normalisePdfContentType(opts.attachment.contentType),
+      description: opts.attachment.description ?? opts.attachment.fileName,
+    };
+  }
+
+  return { expense };
+}
 
 export async function createExpense(opts: {
   categoryUrl: string;
@@ -346,22 +573,78 @@ export async function createExpense(opts: {
   currency?: string;
   salesTaxRate?: string;
   manualSalesTaxAmount?: string;
+  projectUrl?: string;
+  userUrl?: string;
+  attachment?: ExpenseAttachmentInput;
 }): Promise<Expense> {
-  validateCategoryPath(opts.categoryUrl);
+  // Validate caller input before spending a round-trip on /users/me.
+  resolveCategoryUrl(opts.categoryUrl);
+  if (opts.projectUrl) resolveProjectUrl(opts.projectUrl);
+  toExpenseClaimValue(opts.grossValue);
 
-  const body: Record<string, unknown> = {
-    expense: {
-      category: `${FA_API_BASE}${opts.categoryUrl}`,
-      dated_on: opts.datedOn,
-      description: opts.description,
-      gross_value: opts.grossValue,
-      currency: opts.currency ?? "GBP",
-      ...(opts.salesTaxRate && { sales_tax_rate: opts.salesTaxRate }),
-      ...(opts.manualSalesTaxAmount && {
-        manual_sales_tax_amount: opts.manualSalesTaxAmount,
-      }),
-    },
+  const userUrl = opts.userUrl ?? (await getCurrentUserUrl());
+  const body = buildExpenseBody({ ...opts, userUrl });
+
+  const data = await faPost<{ expense: Expense }>("/expenses", body);
+  const expense = data.expense;
+  return { ...expense, id: extractId(expense) };
+}
+
+// ── Mileage expenses ─────────────────────────────────────────────────────────
+
+export type VehicleType = "Car" | "Motorcycle" | "Bicycle";
+
+/**
+ * Mileage is a special expense category. FreeAgent requires `mileage` and
+ * `vehicle_type` on it and computes gross_value itself from the account's
+ * configured mileage rate — sending a gross_value instead is rejected with
+ * "mileage is not a number; vehicle_type is unrecognised".
+ */
+export function buildMileageExpenseBody(opts: {
+  userUrl: string;
+  categoryUrl: string;
+  datedOn: string;
+  description: string;
+  miles: number;
+  vehicleType: VehicleType;
+  currency?: string;
+  projectUrl?: string;
+  rebillType?: "cost" | "markup" | "price";
+}): { expense: Record<string, unknown> } {
+  const expense: Record<string, unknown> = {
+    user: opts.userUrl,
+    category: resolveCategoryUrl(opts.categoryUrl),
+    dated_on: opts.datedOn,
+    description: opts.description,
+    mileage: opts.miles,
+    vehicle_type: opts.vehicleType,
+    reclaim_mileage: 1,
+    currency: opts.currency ?? "GBP",
   };
+  if (opts.projectUrl) expense["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.rebillType) expense["rebill_type"] = opts.rebillType;
+  return { expense };
+}
+
+export async function createMileageExpense(opts: {
+  categoryUrl: string;
+  datedOn: string;
+  description: string;
+  miles: number;
+  vehicleType: VehicleType;
+  currency?: string;
+  projectUrl?: string;
+  rebillType?: "cost" | "markup" | "price";
+  userUrl?: string;
+}): Promise<Expense> {
+  resolveCategoryUrl(opts.categoryUrl);
+  if (opts.projectUrl) resolveProjectUrl(opts.projectUrl);
+  if (!Number.isFinite(opts.miles) || opts.miles <= 0) {
+    throw new Error(`Invalid mileage "${opts.miles}". Expected a positive number of miles.`);
+  }
+
+  const userUrl = opts.userUrl ?? (await getCurrentUserUrl());
+  const body = buildMileageExpenseBody({ ...opts, userUrl });
 
   const data = await faPost<{ expense: Expense }>("/expenses", body);
   const expense = data.expense;
@@ -391,16 +674,72 @@ export async function linkExpenseToEntry(opts: {
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
+/**
+ * Pull human-readable validation messages out of a FreeAgent error body.
+ *
+ * FreeAgent uses several shapes:
+ *   {"errors":[{"message":"user can't be blank"}, …]}   ← 422 validation
+ *   {"errors":{"error":{"message":"…"}}}
+ *   {"error":"invalid_grant","error_description":"…"}   ← OAuth
+ *   {"errors":{"dated_on":["is not a valid date"]}}     ← field-keyed
+ *
+ * The previous implementation called String() on each entry, so an array of
+ * objects rendered as "[object Object], [object Object]" and the real
+ * messages never reached the caller.
+ */
+export function extractFreeAgentErrors(data: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<object>();
+
+  const walk = (value: unknown, field?: string): void => {
+    if (value === null || value === undefined) return;
+    if (typeof value === "string") {
+      const text = value.trim();
+      if (text) out.push(field ? `${field}: ${text}` : text);
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (seen.has(value as object)) return;
+    seen.add(value as object);
+
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, field);
+      return;
+    }
+
+    const obj = value as Record<string, unknown>;
+    // A {"message": "…"} node is the message itself — don't recurse further.
+    if (typeof obj["message"] === "string") {
+      walk(obj["message"], field);
+      return;
+    }
+    for (const [key, child] of Object.entries(obj)) {
+      // "errors"/"error" are envelopes, not field names; everything else
+      // (e.g. "dated_on") is worth showing alongside its message.
+      const nextField =
+        key === "errors" || key === "error" || key === "error_description"
+          ? field
+          : key;
+      walk(child, nextField);
+    }
+  };
+
+  walk(data);
+  return [...new Set(out)];
+}
+
+/** Render an error body as a single readable string, capped for safety. */
+function formatErrorDetail(data: unknown): string {
+  const messages = extractFreeAgentErrors(data);
+  const detail = messages.join("; ");
+  return detail.length > 600 ? `${detail.slice(0, 600)}…` : detail;
+}
+
 export function handleFAError(error: unknown): string {
   if (error instanceof AxiosError) {
     if (error.response) {
       const status = error.response.status;
-      const rawErrors = (error.response.data as { errors?: unknown })?.errors;
-      const detail = Array.isArray(rawErrors)
-        ? rawErrors.map(String).join(", ")
-        : rawErrors != null
-          ? String(rawErrors)
-          : "";
+      const detail = formatErrorDetail(error.response.data);
       switch (status) {
         case 401:
           return "Error: FreeAgent authentication failed. Check FREEAGENT_CLIENT_ID, CLIENT_SECRET, and REFRESH_TOKEN.";

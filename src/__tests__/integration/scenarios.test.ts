@@ -97,7 +97,7 @@ describe("Scenario: approve a marked-for-review transaction", () => {
         explanationId: "9000001",
         category: "../../../evil",
       })
-    ).rejects.toThrow(/Invalid category path/);
+    ).rejects.toThrow(/Invalid category/);
 
     expect(mock.state.explanationUpdates).toHaveLength(0);
   });
@@ -140,6 +140,9 @@ describe("Scenario: list categories (cached)", () => {
 
     expect(categories.length).toBeGreaterThan(0);
     expect(categories.map((c) => c.nominal_code)).toContain("285");
-    expect(categories.map((c) => c.nominal_code)).toContain("311");
+    expect(categories.map((c) => c.nominal_code)).toContain("249");
+    // All four category groups must be flattened, not just admin expenses.
+    expect(categories.map((c) => c.nominal_code)).toContain("150");
+    expect(categories.map((c) => c.nominal_code)).toContain("001");
   });
 });

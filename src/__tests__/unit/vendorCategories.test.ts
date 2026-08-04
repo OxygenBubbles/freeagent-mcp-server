@@ -17,17 +17,17 @@ afterEach(() => {
 
 describe("lookupCategory", () => {
   it("returns the URL for a known exact vendor", () => {
-    expect(lookupCategory("IONOS")).toBe("/v2/categories/285");
+    expect(lookupCategory("IONOS")).toBe("/v2/categories/268");
   });
 
   it("matches case-insensitively", () => {
-    expect(lookupCategory("ionos")).toBe("/v2/categories/285");
-    expect(lookupCategory("Ionos")).toBe("/v2/categories/285");
+    expect(lookupCategory("ionos")).toBe("/v2/categories/268");
+    expect(lookupCategory("Ionos")).toBe("/v2/categories/268");
   });
 
   it("does a fuzzy substring match", () => {
-    expect(lookupCategory("IONOS Cloud Services Ltd")).toBe("/v2/categories/285");
-    expect(lookupCategory("My OpenAI invoice")).toBe("/v2/categories/270");
+    expect(lookupCategory("IONOS Cloud Services Ltd")).toBe("/v2/categories/268");
+    expect(lookupCategory("My OpenAI invoice")).toBe("/v2/categories/269");
   });
 
   it("returns undefined for an unknown vendor", () => {
@@ -39,7 +39,7 @@ describe("lookupCategory", () => {
     _resetVendorCategoriesCache();
     expect(lookupCategory("CustomVendor")).toBe("/v2/categories/999");
     // Defaults still work
-    expect(lookupCategory("IONOS")).toBe("/v2/categories/285");
+    expect(lookupCategory("IONOS")).toBe("/v2/categories/268");
   });
 
   it("custom mapping overrides a default for the same key", () => {
@@ -56,7 +56,7 @@ describe("lookupCategory", () => {
     process.env.VENDOR_CATEGORIES = "{invalid json}";
     _resetVendorCategoriesCache();
 
-    expect(lookupCategory("IONOS")).toBe("/v2/categories/285"); // defaults intact
+    expect(lookupCategory("IONOS")).toBe("/v2/categories/268"); // defaults intact
     expect(warnings.some((w) => w.includes("VENDOR_CATEGORIES"))).toBe(true);
 
     process.stderr.write = original;

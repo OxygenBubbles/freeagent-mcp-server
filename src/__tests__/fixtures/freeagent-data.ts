@@ -77,12 +77,12 @@ export function makeBankTransaction(
 }
 
 export function makeCategory(overrides: Partial<ExpenseCategory> = {}): ExpenseCategory {
-  const url = overrides.url ?? "/v2/categories/285";
+  const nominal = overrides.nominal_code ?? "269";
   return {
-    url,
+    url: `${API}/categories/${nominal}`,
     description: "Computer Software",
-    nominal_code: "285",
-    group: "Admin Expenses",
+    nominal_code: nominal,
+    group_description: "Admin expenses (normally VATable)",
     allowable_for_tax: true,
     ...overrides,
   };
@@ -179,10 +179,62 @@ export const defaultFixture = {
     }),
   ],
 
-  categories: [
-    makeCategory({ url: "/v2/categories/270", description: "Computer Software", nominal_code: "270" }),
-    makeCategory({ url: "/v2/categories/285", description: "Web Hosting",       nominal_code: "285" }),
-    makeCategory({ url: "/v2/categories/311", description: "Motor Mileage",     nominal_code: "311", group: "Travel" }),
-    makeCategory({ url: "/v2/categories/365", description: "Stationery",        nominal_code: "365" }),
+  user: {
+    url: `${API}/users/2000001`,
+    first_name: "Test",
+    last_name: "User",
+    email: "user@example.com",
+  },
+
+  projects: [
+    {
+      url: `${API}/projects/6000001`,
+      name: "Synthetic Client Engagement",
+      status: "Active",
+      currency: "GBP",
+      contact: `${API}/contacts/5000001`,
+    },
+    {
+      url: `${API}/projects/6000002`,
+      name: "Internal R&D",
+      status: "Active",
+      currency: "GBP",
+    },
   ],
+
+  // GET /v2/categories returns four parallel arrays, NOT a flat list.
+  categories: {
+    admin_expenses_categories: [
+      makeCategory({ nominal_code: "269", description: "Computer Software" }),
+      makeCategory({ nominal_code: "268", description: "Web Hosting" }),
+      makeCategory({ nominal_code: "249", description: "Mileage" }),
+      makeCategory({ nominal_code: "285", description: "Accommodation and Meals" }),
+      makeCategory({
+        nominal_code: "365",
+        description: "Travel",
+        group_description: "Admin expenses (normally Zero-VAT)",
+      }),
+    ],
+    cost_of_sales_categories: [
+      makeCategory({
+        nominal_code: "150",
+        description: "Subcontractor Costs",
+        group_description: "Cost of sales",
+      }),
+    ],
+    income_categories: [
+      makeCategory({
+        nominal_code: "001",
+        description: "Sales",
+        group_description: "Income",
+      }),
+    ],
+    general_categories: [
+      makeCategory({
+        nominal_code: "750",
+        description: "Bank Account",
+        group_description: "Current assets",
+      }),
+    ],
+  },
 };

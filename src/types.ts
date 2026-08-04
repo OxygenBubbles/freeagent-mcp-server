@@ -83,6 +83,12 @@ export interface Expense {
   currency: string;
   manual_sales_tax_amount?: string;
   attachment?: string;
+  project?: string;
+  // Mileage-category expenses only
+  mileage?: string;
+  vehicle_type?: string;
+  reclaim_mileage?: number;
+  reclaim_mileage_rate?: string;
 }
 
 export interface ExpenseCategory {
@@ -90,7 +96,25 @@ export interface ExpenseCategory {
   description: string;
   nominal_code: string;
   group?: string;
+  /** FreeAgent's own grouping label, e.g. "Admin expenses (normally VATable)". */
+  group_description?: string;
+  /** Which of the four /v2/categories arrays this category came from. */
+  category_type?: string;
   allowable_for_tax?: boolean;
+  tax_reporting_name?: string;
+  auto_sales_tax_rate?: string;
+}
+
+export interface Project {
+  url: string;
+  id: string;
+  name: string;
+  contact?: string;
+  status: string;
+  currency?: string;
+  budget?: number;
+  budget_units?: string;
+  is_ir35?: boolean;
 }
 
 // ── Distance types ──────────────────────────────────────────────────────────

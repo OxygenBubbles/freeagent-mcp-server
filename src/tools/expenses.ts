@@ -3,9 +3,9 @@ import { z } from "zod";
 import {
   createExpense,
   listCategories,
+  listProjects,
   listBankTransactions,
   linkExpenseToEntry,
-  uploadAttachment,
   handleFAError,
 } from "../services/freeagent.js";
 import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE } from "../constants.js";
@@ -16,8 +16,12 @@ import { lookupCategory } from "../utils/vendorCategories.js";
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
 
-// Category path must be /v2/categories/<numeric-id>
-const CATEGORY_PATH_REGEX = /^\/v2\/categories\/\d+$/;
+// Category reference: the "/v2/categories/<id>" path form or the full API URL.
+const CATEGORY_PATH_REGEX =
+  /^(?:https:\/\/api\.freeagent\.com)?\/v2\/categories\/\d+$/;
+
+// Project reference: the "/v2/projects/<id>" path form or the full API URL.
+const PROJECT_PATH_REGEX = /^(?:https:\/\/api\.freeagent\.com)?\/v2\/projects\/\d+$/;
 
 // Minimum vendor string length for fuzzy bank transaction matching
 const MIN_VENDOR_MATCH_LEN = 3;
@@ -44,7 +48,10 @@ export function registerExpenseTools(server: McpServer): void {
           url: c.url,
           description: c.description,
           nominal_code: c.nominal_code,
-          group: c.group ?? null,
+          group: c.group_description ?? c.group ?? null,
+          category_type: c.category_type ?? null,
+          allowable_for_tax: c.allowable_for_tax ?? null,
+          auto_sales_tax_rate: c.auto_sales_tax_rate ?? null,
         }));
         return {
           content: [
@@ -54,6 +61,53 @@ export function registerExpenseTools(server: McpServer): void {
             },
           ],
           structuredContent: { categories: rows, count: rows.length },
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: handleFAError(err) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ── List projects ───────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_list_projects",
+    {
+      description:
+        "List FreeAgent projects. Returns project URL, name, status and contact. " +
+        "Use the project URL to tag an expense to a client engagement via freeagent_create_expense.",
+      inputSchema: z
+        .object({
+          view: z
+            .enum(["active", "completed", "cancelled", "all"])
+            .default("active")
+            .describe("Which projects to return (default: active)"),
+        })
+        .strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+    async (args) => {
+      try {
+        const projects = await listProjects(args.view);
+        const rows = projects.map((p) => ({
+          url: p.url,
+          id: p.id,
+          name: p.name,
+          status: p.status,
+          contact: p.contact ?? null,
+          currency: p.currency ?? null,
+        }));
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ projects: rows, count: rows.length }, null, 2),
+            },
+          ],
+          structuredContent: { projects: rows, count: rows.length },
         };
       } catch (err) {
         return {
@@ -114,6 +168,14 @@ export function registerExpenseTools(server: McpServer): void {
             .regex(CATEGORY_PATH_REGEX, "Must be a FreeAgent category path like /v2/categories/285")
             .optional()
             .describe("FreeAgent category URL (e.g. '/v2/categories/285'). Auto-selected from vendor if omitted."),
+          project: z
+            .string()
+            .regex(PROJECT_PATH_REGEX, "Must be a FreeAgent project path like /v2/projects/123")
+            .optional()
+            .describe(
+              "FreeAgent project URL (e.g. '/v2/projects/123') to tag the expense against, " +
+              "so it can be rebilled or reported per client. Use freeagent_list_projects to find it."
+            ),
           fileBase64: z
             .string()
             .max(FILE_BASE64_MAX, "File must be under ~7.5 MB (10 MB base64)")
@@ -167,6 +229,17 @@ export function registerExpenseTools(server: McpServer): void {
           };
         }
 
+        // Attach the receipt inline on create, so a rejected attachment fails
+        // the whole call rather than leaving a receiptless expense behind.
+        const attachment =
+          args.fileBase64 && args.fileName
+            ? {
+                fileName: args.fileName,
+                contentType: args.contentType ?? inferContentType(args.fileName),
+                fileBase64: args.fileBase64,
+              }
+            : undefined;
+
         // Create expense
         const expense = await createExpense({
           categoryUrl,
@@ -175,22 +248,13 @@ export function registerExpenseTools(server: McpServer): void {
           grossValue: args.grossAmount,
           currency: args.currency,
           manualSalesTaxAmount: args.vatAmount,
+          projectUrl: args.project,
+          attachment,
         });
 
         const actions: string[] = [`Expense created (${expense.id})`];
-
-        // Attach receipt if provided
-        if (args.fileBase64 && args.fileName) {
-          const ct = args.contentType ?? inferContentType(args.fileName);
-          await uploadAttachment({
-            entityId: expense.id,
-            entityType: "expense",
-            fileName: args.fileName,
-            contentType: ct,
-            fileBase64: args.fileBase64,
-          });
-          actions.push(`Receipt attached: ${args.fileName}`);
-        }
+        if (attachment) actions.push(`Receipt attached: ${attachment.fileName}`);
+        if (args.project) actions.push(`Tagged to project ${args.project}`);
 
         // Auto-match bank transaction if requested
         let matchedEntryId: string | null = null;

@@ -16,26 +16,48 @@ export const HMRC_RATE_LOW_PENCE = 25;  // miles above 10,000
 export const HMRC_THRESHOLD_MILES = 10_000;
 
 // Default vendor → FreeAgent category URL mappings.
-// Users can extend via VENDOR_CATEGORIES env var (JSON).
+// Users can extend or override via the VENDOR_CATEGORIES env var (JSON).
+//
+// Nominal codes below are FreeAgent's standard UK chart of accounts:
+//   268 Web Hosting            269 Computer Software
+//   285 Accommodation and Meals  365 Travel
+// (Earlier versions mapped software to 270 and hosting to 285. In a real
+// account 270 is Computer Hardware and 285 is Accommodation and Meals, so
+// every SaaS and hosting expense was being posted to the wrong nominal code.)
 export const DEFAULT_VENDOR_CATEGORIES: Record<string, string> = {
-  "IONOS": "/v2/categories/285",
-  "OpenAI": "/v2/categories/270",
-  "Anthropic": "/v2/categories/270",
-  "Amazon Web Services": "/v2/categories/285",
-  "GitHub": "/v2/categories/270",
-  "Stripe": "/v2/categories/270",
-  "Google": "/v2/categories/270",
-  "Microsoft": "/v2/categories/270",
-  "Zoom": "/v2/categories/270",
-  "Notion": "/v2/categories/270",
-  "Dropbox": "/v2/categories/270",
-  "Slack": "/v2/categories/270",
-  "Adobe": "/v2/categories/270",
-  "Netlify": "/v2/categories/285",
-  "Vercel": "/v2/categories/285",
-  "Heroku": "/v2/categories/285",
-  "DigitalOcean": "/v2/categories/285",
-  "Cloudflare": "/v2/categories/285",
-  "Fastmail": "/v2/categories/270",
-  "Mailchimp": "/v2/categories/270",
+  // Hosting / infrastructure → Web Hosting
+  "IONOS": "/v2/categories/268",
+  "Amazon Web Services": "/v2/categories/268",
+  "Netlify": "/v2/categories/268",
+  "Vercel": "/v2/categories/268",
+  "Heroku": "/v2/categories/268",
+  "DigitalOcean": "/v2/categories/268",
+  "Cloudflare": "/v2/categories/268",
+
+  // SaaS / subscriptions → Computer Software
+  "OpenAI": "/v2/categories/269",
+  "Anthropic": "/v2/categories/269",
+  "GitHub": "/v2/categories/269",
+  "Stripe": "/v2/categories/269",
+  "Google": "/v2/categories/269",
+  "Microsoft": "/v2/categories/269",
+  "Zoom": "/v2/categories/269",
+  "Notion": "/v2/categories/269",
+  "Dropbox": "/v2/categories/269",
+  "Slack": "/v2/categories/269",
+  "Adobe": "/v2/categories/269",
+  "Fastmail": "/v2/categories/269",
+  "Mailchimp": "/v2/categories/269",
+
+  // Travel and accommodation → Accommodation and Meals
+  "Booking.com": "/v2/categories/285",
+  "Hotels.com": "/v2/categories/285",
+  "Premier Inn": "/v2/categories/285",
+  "Travelodge": "/v2/categories/285",
+  "Airbnb": "/v2/categories/285",
+
+  // Transport → Travel
+  "Trainline": "/v2/categories/365",
+  "LNER": "/v2/categories/365",
+  "Uber": "/v2/categories/365",
 };
