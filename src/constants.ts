@@ -19,7 +19,9 @@ export const REPORT_MAX_RECORDS = 2000;
 
 // Bank transaction matching (expense → bank entry)
 export const DATE_TOLERANCE_DAYS = 4;
-export const AMOUNT_TOLERANCE = 0.01; // £0.01 tolerance for floating-point
+// Matching tolerance in whole pence. Comparing money as floats made the
+// boundary case behave backwards: |84.51 - 84.50| is 0.0100000000000051.
+export const AMOUNT_TOLERANCE_PENCE = 1;
 
 // Mileage — HMRC approved mileage allowance payments (default rates)
 export const HMRC_RATE_HIGH_PENCE = 45; // first 10,000 miles per tax year

@@ -64,17 +64,35 @@ function debugEnabled(): boolean {
 const SECRET_SEGMENTS = new Set([
   "secret", "secrets", "password", "passwd", "pwd",
   "token", "tokens", "key", "keys", "apikey",
-  "credential", "credentials", "authorization", "auth", "bearer", "signature",
+  "credential", "credentials", "authorization", "auth", "bearer",
+  "signature", "sig", "cookie", "cookies", "jwt", "otp", "nonce",
 ]);
 
-/** Suffixes that describe a secret rather than being one. */
-const DESCRIPTIVE_SUFFIX = /_(count|type|name|at|on|url|id|length|size|expires_in)$/;
+/**
+ * Suffixes that make a key metadata ABOUT a secret rather than the secret.
+ *
+ * Deliberately narrow: `_url` and `_id` are not here, because a signed
+ * `secret_url` carries the credential in its query string and a `token_id`
+ * is often the token itself.
+ */
+const METADATA_SUFFIX = /_(count|type|name|at|on|length|size)$/;
+
+/** Keys that contain a secret word but are structural, not sensitive. */
+const BENIGN_KEYS = new Set([
+  "foreign_key", "primary_key", "sort_key", "partition_key", "idempotency_key",
+]);
 
 function isSecretKey(key: string): boolean {
   const lower = key.toLowerCase();
   if (lower === "data") return true; // base64 attachment payload
-  if (DESCRIPTIVE_SUFFIX.test(lower)) return false;
-  return lower.split(/[_\-.]/).some((segment) => SECRET_SEGMENTS.has(segment));
+  if (BENIGN_KEYS.has(lower)) return false;
+  if (METADATA_SUFFIX.test(lower)) return false;
+  // Split snake_case, kebab-case, dots AND camelCase, so clientSecret and
+  // accessToken are caught alongside client_secret and access_token.
+  const segments = lower === key
+    ? lower.split(/[_\-.]/)
+    : key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[_\-.]/);
+  return segments.some((segment) => SECRET_SEGMENTS.has(segment));
 }
 
 /** Patterns that look like credentials wherever they appear in a string. */

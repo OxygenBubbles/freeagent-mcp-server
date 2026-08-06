@@ -8,10 +8,10 @@ import {
   linkExpenseToEntry,
   handleFAError,
 } from "../services/freeagent.js";
-import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE } from "../constants.js";
+import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE_PENCE } from "../constants.js";
 import { inferContentType } from "../utils/contentType.js";
 import { parseAmount, addDays } from "../utils/amount.js";
-import { parseStrictDecimal } from "../utils/money.js";
+import { findMatchingTransactions, decideLink } from "../utils/matchTransaction.js";
 import { lookupCategory } from "../utils/vendorCategories.js";
 import { dateSchema } from "./respond.js";
 
@@ -280,32 +280,36 @@ export function registerExpenseTools(server: McpServer): void {
           const amount = parseAmount(args.grossAmount, "grossAmount");
           const upperVendor = args.vendor.toUpperCase();
 
-          const match = transactions.find((t) => {
-            // Strict: a permissive parse could match the wrong transaction.
-            let txAmount: number;
-            try {
-              txAmount = parseStrictDecimal(t.amount, "bank transaction amount");
-            } catch {
-              return false;
-            }
-            const amountMatch = Math.abs(Math.abs(txAmount) - amount) <= AMOUNT_TOLERANCE;
-            const descMatch =
-              upperVendor.length >= MIN_VENDOR_MATCH_LEN &&
-              t.description.toUpperCase().includes(upperVendor);
-            return amountMatch && descMatch;
+          const matches = findMatchingTransactions(transactions, {
+            amount: args.grossAmount,
+            vendor: args.vendor,
+            tolerancePence: AMOUNT_TOLERANCE_PENCE,
+            minVendorLength: MIN_VENDOR_MATCH_LEN,
           });
+          const decision = decideLink(matches, moreCandidates);
 
-          if (match) {
+          if (decision.action === "link") {
             await linkExpenseToEntry({
-              entryId: match.id,
+              entryId: decision.match.id,
               expenseUrl: expense.url,
             });
-            matchedEntryId = match.id;
-            actions.push(`Linked to bank transaction ${match.id} (${match.description}, ${match.amount})`);
+            matchedEntryId = decision.match.id;
+            actions.push(
+              `Linked to bank transaction ${decision.match.id} (${decision.match.description}, ${decision.match.amount})`
+            );
+          } else if (decision.action === "ambiguous") {
+            actions.push(
+              `Not linked: ${decision.matches.length} bank transactions match (${decision.matches
+                .map((m) => `${m.id} ${m.dated_on} ${m.amount}`)
+                .join("; ")}). Link the right one manually.`
+            );
+          } else if (decision.action === "incomplete") {
+            actions.push(
+              `Not linked: found one match (${decision.matches[0]!.id}) but more unexplained transactions exist beyond the ${transactions.length} searched, so it may not be the only candidate. Confirm manually.`
+            );
           } else {
-            // Say what was actually searched. "No match" over a truncated
-            // candidate set reads as "no such transaction exists", and the
-            // user files a duplicate.
+            // "No match" over a truncated candidate set reads as "no such
+            // transaction exists", and the user files a duplicate.
             actions.push(
               moreCandidates
                 ? `No match in the first ${transactions.length} unexplained transactions in the date window, but more exist — expense stands alone as a claim; check manually`

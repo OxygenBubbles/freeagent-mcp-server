@@ -90,7 +90,7 @@ export function registerReportTools(server: McpServer): void {
             total: e.total,
             category: e.category,
           }));
-        const { total: sum } = sumResponseMoney(
+        const { total: sum, missing: missingBalances } = sumResponseMoney(
           rows.map((r) => r.total),
           "trial balance total"
         );
@@ -99,6 +99,14 @@ export function registerReportTools(server: McpServer): void {
           count: rows.length,
           // A balanced ledger sums to zero; a non-zero figure signals a problem.
           sumOfBalances: sum,
+          // Accounts whose balance was absent are excluded from the sum above
+          // rather than counted as zero, which would fake a balanced ledger.
+          missingBalances,
+          ...(missingBalances > 0
+            ? {
+                warning: `${missingBalances} account(s) returned no balance and are excluded; sumOfBalances is not a reliable balance check.`,
+              }
+            : {}),
         });
       } catch (err) {
         return fail(err);

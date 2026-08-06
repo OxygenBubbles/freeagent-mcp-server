@@ -33,7 +33,7 @@ function isBlockedIPv4(ip: string): boolean {
   if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
     return true; // unparseable — refuse rather than guess
   }
-  const [a, b] = parts as [number, number, number, number];
+  const [a, b, c] = parts as [number, number, number, number];
   if (a === 0) return true; // "this" network
   if (a === 10) return true; // RFC1918
   if (a === 127) return true; // loopback
@@ -41,7 +41,14 @@ function isBlockedIPv4(ip: string): boolean {
   if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
   if (a === 192 && b === 168) return true; // RFC1918
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  if (a >= 224) return true; // multicast + reserved
+  if (a >= 224) return true; // multicast + reserved (224/4 and 240/4)
+  // IANA special-purpose ranges that are not globally reachable but may well
+  // be routed inside a network.
+  if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments
+  if (a === 192 && b === 0 && c === 2) return true; // TEST-NET-1
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking 198.18/15
+  if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
   return false;
 }
 
@@ -99,35 +106,62 @@ function groupsToIPv4(hi: number, lo: number): string {
 /**
  * Classify an IPv6 address.
  *
- * This is an ALLOWLIST: everything outside global unicast (2000::/3) is
- * refused. Enumerating bad prefixes kept missing things — ::ffff:0:127.0.0.1
- * (IPv4-translatable) and 64:ff9b::127.0.0.1 (NAT64) both carry a private IPv4
- * destination while looking nothing like the classic mapped form. Allowing only
- * global unicast rejects all of those by construction, and the few transition
- * formats that ARE globally shaped are unwrapped and judged on the IPv4 address
- * they embed.
+ * Structure:
+ *  1. Formats that EMBED an IPv4 destination are unwrapped and judged on that
+ *     address, so ::ffff:8.8.8.8 stays reachable while ::ffff:127.0.0.1 does
+ *     not. Blanket-refusing these ranges was safe but broke public mapped
+ *     literals and IPv6-only NAT64 networks.
+ *  2. Everything outside global unicast (2000::/3) is refused — that disposes
+ *     of ::, ::1, fc00::/7, fe80::/10 and ff00::/8 without a rule each.
+ *  3. Inside 2000::/3, the IANA special-purpose prefixes are refused too.
+ *     "Globally shaped" is not the same as "globally reachable": documentation
+ *     and benchmarking space is frequently routed inside a network, which is
+ *     exactly what an SSRF wants to reach.
  */
 function isBlockedIPv6(ip: string): boolean {
   const groups = expandIPv6(ip);
   if (groups === null) return true; // unparseable — refuse
 
-  const [g0, g1, g2, , , , g6, g7] = groups as number[];
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups as number[];
+  const leadingZero = g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0;
 
-  // Anything outside 2000::/3 (global unicast) is refused. That covers ::,
-  // ::1, ::ffff:*/96, ::ffff:0:*/96, 64:ff9b::/96, fc00::/7, fe80::/10 and
-  // ff00::/8 without needing a rule for each.
+  // ── 1. Embedded-IPv4 formats, judged on what they actually reach ──────────
+
+  // ::ffff:0:0/96 — IPv4-mapped.
+  if (leadingZero && g4 === 0 && g5 === 0xffff) {
+    return isBlockedIPv4(groupsToIPv4(g6!, g7!));
+  }
+  // ::ffff:0:0:0/96 — IPv4-translatable (RFC 6052).
+  if (leadingZero && g4 === 0xffff && g5 === 0) {
+    return isBlockedIPv4(groupsToIPv4(g6!, g7!));
+  }
+  // 64:ff9b::/96 and 64:ff9b:1::/48 — NAT64 well-known and local-use prefixes.
+  if (g0 === 0x0064 && g1 === 0xff9b) {
+    return isBlockedIPv4(groupsToIPv4(g6!, g7!));
+  }
+  // ::a.b.c.d — deprecated IPv4-compatible, still reaches v4.
+  if (leadingZero && g4 === 0 && g5 === 0 && (g6 !== 0 || g7 !== 0)) {
+    return isBlockedIPv4(groupsToIPv4(g6!, g7!));
+  }
+
+  // ── 2. Only global unicast is considered at all ───────────────────────────
   if ((g0! & 0xe000) !== 0x2000) return true;
+
+  // ── 3. Special-purpose prefixes inside global unicast ─────────────────────
 
   // 2002::/16 — 6to4 carries its IPv4 address in the next two groups.
   if (g0 === 0x2002) return isBlockedIPv4(groupsToIPv4(g1!, g2!));
-
-  // 2001:0000::/32 — Teredo tunnelling. The client address is obfuscated in
-  // the last two groups; refuse the whole prefix rather than chase it.
+  // 2001:0000::/32 — Teredo. The client address is obfuscated; refuse outright.
   if (g0 === 0x2001 && g1 === 0x0000) return true;
+  // 2001:2::/48 — benchmarking.
+  if (g0 === 0x2001 && g1 === 0x0002 && g2 === 0x0000) return true;
+  // 2001:20::/28 — ORCHIDv2 (2001:0020 through 2001:002f).
+  if (g0 === 0x2001 && (g1! & 0xfff0) === 0x0020) return true;
+  // 2001:db8::/32 — documentation.
+  if (g0 === 0x2001 && g1 === 0x0db8) return true;
+  // 3fff::/20 — documentation (RFC 9637).
+  if ((g0! & 0xfff0) === 0x3ff0) return true;
 
-  // Discard-only prefix 100::/64 is outside 2000::/3 and already refused.
-  void g6;
-  void g7;
   return false;
 }
 

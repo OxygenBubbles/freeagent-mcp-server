@@ -98,6 +98,44 @@ describe("isBlockedAddress", () => {
     expect(isBlockedAddress("2002:0808:0808::")).toBe(false); // 8.8.8.8
   });
 
+  it("blocks IANA special-use ranges that merely LOOK globally routable", () => {
+    // Inside 2000::/3, so a /3 bit-test called these public — but they are
+    // routinely routed inside a network, which is what an SSRF wants.
+    expect(isBlockedAddress("2001:db8::1")).toBe(true); // documentation
+    expect(isBlockedAddress("2001:2::1")).toBe(true); // benchmarking
+    expect(isBlockedAddress("2001:20::1")).toBe(true); // ORCHIDv2
+    expect(isBlockedAddress("2001:2f::1")).toBe(true); // ORCHIDv2 upper bound
+    expect(isBlockedAddress("3fff::1")).toBe(true); // documentation (RFC 9637)
+  });
+
+  it("blocks IPv4 special-use ranges", () => {
+    for (const ip of [
+      "198.18.0.1", "198.19.255.1", // benchmarking
+      "192.0.2.5", "198.51.100.5", "203.0.113.5", // TEST-NETs
+      "192.0.0.1", // IETF protocol assignments
+    ]) {
+      expect(isBlockedAddress(ip), ip).toBe(true);
+    }
+  });
+
+  it("allows a PUBLIC IPv4 destination wrapped in a transition format", () => {
+    // Blanket-refusing these ranges was safe but wrong: it broke public mapped
+    // literals and IPv6-only NAT64 networks. Unwrap and judge what they reach.
+    expect(isBlockedAddress("::ffff:8.8.8.8")).toBe(false);
+    expect(isBlockedAddress("64:ff9b::8.8.8.8")).toBe(false);
+  });
+
+  it("allows the real-world IPv6 ranges CDNs actually serve from", () => {
+    for (const ip of [
+      "2001:4860:4860::8888", // Google
+      "2606:4700::1111", // Cloudflare
+      "2a00:1450:4009::200e", // Google EU
+      "2600:1901::1", // ARIN space
+    ]) {
+      expect(isBlockedAddress(ip), ip).toBe(false);
+    }
+  });
+
   it("rejects an address with a ':: ' that compresses nothing", () => {
     expect(expandIPv6("1:2:3:4:5:6:7:8::")).toBeNull();
   });
@@ -215,6 +253,35 @@ describe("debug-log redaction", () => {
     expect(serialised).toContain("receipt.pdf");
   });
 
+  it("redacts camelCase and suffix-bearing credential keys", async () => {
+    const { _redactForTests } = await import("../../services/freeagent.js");
+    const out = _redactForTests({
+      clientSecret: "LEAK1",
+      accessToken: "LEAK2",
+      apiKey: "LEAK3",
+      session_cookie: "LEAK4",
+      secret_url: "https://x/?sig=LEAK5",
+      token_id: "LEAK6",
+      private_key: "LEAK7",
+      stripe_secret_key: "LEAK8",
+    });
+    const serialised = JSON.stringify(out);
+    for (let i = 1; i <= 8; i++) {
+      expect(serialised, `LEAK${i}`).not.toContain(`LEAK${i}`);
+    }
+  });
+
+  it("leaves structural keys containing a secret word readable", async () => {
+    const { _redactForTests } = await import("../../services/freeagent.js");
+    const out = _redactForTests({
+      foreign_key: "invoices.id",
+      idempotency_key: "abc",
+      api_key_name: "production",
+    }) as Record<string, unknown>;
+    expect(out["foreign_key"]).toBe("invoices.id");
+    expect(out["api_key_name"]).toBe("production");
+  });
+
   it("does not corrupt legitimate fields whose names merely contain a keyword", async () => {
     const { _redactForTests } = await import("../../services/freeagent.js");
     const out = _redactForTests({
@@ -234,15 +301,42 @@ describe("debug-log redaction", () => {
 });
 
 describe("proxy handling", () => {
-  it("never proxies an untrusted download", async () => {
-    // With HTTP_PROXY set, axios dials the PROXY and passes the destination on
-    // as an absolute URL — so the lookup guard would validate the proxy and the
-    // proxy would fetch the private destination for us. proxy:false is the only
-    // thing standing between that and an SSRF.
-    const { readFileSync } = await import("node:fs");
-    const source = readFileSync("src/services/freeagent.ts", "utf8");
-    const fetchFn = source.slice(source.indexOf("export async function fetchUrlAsBase64"));
-    const body = fetchFn.slice(0, fetchFn.indexOf("\n}\n"));
-    expect(body).toContain("proxy: false");
-  });
+  it("never routes an untrusted download through a configured proxy", async () => {
+    // With HTTP_PROXY set, axios would dial the PROXY and pass the destination
+    // on as an absolute URL — so the lookup guard would validate the proxy
+    // while the proxy fetched the private destination for us. proxy:false is
+    // the only thing preventing that.
+    //
+    // The destination below never resolves, so nothing leaves the machine; the
+    // assertion is that the proxy was not contacted, which it would have been
+    // if the proxy setting were honoured.
+    const http = await import("node:http");
+    const { fetchUrlAsBase64 } = await import("../../services/freeagent.js");
+
+    let proxyHits = 0;
+    const proxy = http.createServer((_req, res) => {
+      proxyHits++;
+      res.end("intercepted");
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
+    const { port } = proxy.address() as { port: number };
+
+    const saved = { ...process.env };
+    for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"]) {
+      process.env[key] = `http://127.0.0.1:${port}`;
+    }
+
+    try {
+      await expect(
+        fetchUrlAsBase64("http://receipts.example.invalid/invoice.pdf")
+      ).rejects.toThrow();
+      expect(proxyHits).toBe(0);
+    } finally {
+      for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"]) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+  }, 20_000);
 });
