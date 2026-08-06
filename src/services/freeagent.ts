@@ -82,6 +82,13 @@ const BENIGN_KEYS = new Set([
   "foreign_key", "primary_key", "sort_key", "partition_key", "idempotency_key",
 ]);
 
+/**
+ * High-signal words matched anywhere in a key, for names that carry no
+ * separator at all — "clientsecret" and "apikey" are single segments, so
+ * segment matching alone let them through.
+ */
+const SECRET_SUBSTRINGS = ["secret", "password", "passwd", "apikey", "credential", "token"];
+
 function isSecretKey(key: string): boolean {
   const lower = key.toLowerCase();
   if (lower === "data") return true; // base64 attachment payload
@@ -92,7 +99,8 @@ function isSecretKey(key: string): boolean {
   const segments = lower === key
     ? lower.split(/[_\-.]/)
     : key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[_\-.]/);
-  return segments.some((segment) => SECRET_SEGMENTS.has(segment));
+  if (segments.some((segment) => SECRET_SEGMENTS.has(segment))) return true;
+  return SECRET_SUBSTRINGS.some((word) => lower.includes(word));
 }
 
 /** Patterns that look like credentials wherever they appear in a string. */

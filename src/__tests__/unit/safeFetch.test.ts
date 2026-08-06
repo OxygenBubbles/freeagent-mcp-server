@@ -118,6 +118,25 @@ describe("isBlockedAddress", () => {
     }
   });
 
+  it("only unwraps the NAT64 well-known /96, not all of 64:ff9b::/32", () => {
+    // 64:ff9b:2::808:808 belongs to no defined NAT64 prefix and sits outside
+    // global unicast, but a /32-wide match unwrapped its public-looking tail
+    // and let it straight through.
+    expect(isBlockedAddress("64:ff9b:2::808:808")).toBe(true);
+    expect(isBlockedAddress("64:ff9b:1::808:808")).toBe(true);
+    expect(isBlockedAddress("64:ff9b::808:808")).toBe(false); // the real /96
+  });
+
+  it("scopes the 3fff::/20 documentation block to exactly /20", () => {
+    // Masking g0 alone implemented 3ff0::/12 and refused 3ff0-3ffe, which is
+    // ordinary global unicast.
+    expect(isBlockedAddress("3fff::1")).toBe(true);
+    expect(isBlockedAddress("3fff:0fff::1")).toBe(true);
+    expect(isBlockedAddress("3fff:1000::1")).toBe(false);
+    expect(isBlockedAddress("3ff0::1")).toBe(false);
+    expect(isBlockedAddress("3ffe::1")).toBe(false);
+  });
+
   it("allows a PUBLIC IPv4 destination wrapped in a transition format", () => {
     // Blanket-refusing these ranges was safe but wrong: it broke public mapped
     // literals and IPv6-only NAT64 networks. Unwrap and judge what they reach.
@@ -271,6 +290,20 @@ describe("debug-log redaction", () => {
     }
   });
 
+  it("redacts credential keys that carry no separator at all", async () => {
+    // Segment matching alone missed these: "clientsecret" is one segment.
+    const { _redactForTests } = await import("../../services/freeagent.js");
+    const out = JSON.stringify(
+      _redactForTests({
+        clientsecret: "LEAK1",
+        apikey: "LEAK2",
+        accesstoken: "LEAK3",
+        mypassword: "LEAK4",
+      })
+    );
+    for (let i = 1; i <= 4; i++) expect(out, `LEAK${i}`).not.toContain(`LEAK${i}`);
+  });
+
   it("leaves structural keys containing a secret word readable", async () => {
     const { _redactForTests } = await import("../../services/freeagent.js");
     const out = _redactForTests({
@@ -301,7 +334,7 @@ describe("debug-log redaction", () => {
 });
 
 describe("proxy handling", () => {
-  it("never routes an untrusted download through a configured proxy", async () => {
+  it("never routes an untrusted download through a configured proxy", async (ctx) => {
     // With HTTP_PROXY set, axios would dial the PROXY and pass the destination
     // on as an absolute URL — so the lookup guard would validate the proxy
     // while the proxy fetched the private destination for us. proxy:false is
@@ -318,7 +351,16 @@ describe("proxy handling", () => {
       proxyHits++;
       res.end("intercepted");
     });
-    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
+    // Some sandboxes deny listen(); the guarantee is still worth asserting
+    // where it can be, so skip rather than fail when the socket is refused.
+    const listening = await new Promise<boolean>((resolve) => {
+      proxy.once("error", () => resolve(false));
+      proxy.listen(0, "127.0.0.1", () => resolve(true));
+    });
+    if (!listening) {
+      ctx.skip();
+      return;
+    }
     const { port } = proxy.address() as { port: number };
 
     const saved = { ...process.env };

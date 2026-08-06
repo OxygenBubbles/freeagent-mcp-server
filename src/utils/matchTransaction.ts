@@ -48,7 +48,7 @@ export type LinkDecision =
   | { action: "link"; match: MatchCandidate }
   | { action: "ambiguous"; matches: MatchCandidate[] }
   | { action: "incomplete"; matches: MatchCandidate[] }
-  | { action: "none" };
+  | { action: "none"; searchWasTruncated: boolean };
 
 /** Decide whether a link may be written, given what was searched. */
 export function decideLink(
@@ -61,5 +61,5 @@ export function decideLink(
       ? { action: "incomplete", matches }
       : { action: "link", match: matches[0]! };
   }
-  return { action: "none" };
+  return { action: "none", searchWasTruncated };
 }

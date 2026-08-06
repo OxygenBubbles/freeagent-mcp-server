@@ -135,8 +135,12 @@ function isBlockedIPv6(ip: string): boolean {
   if (leadingZero && g4 === 0xffff && g5 === 0) {
     return isBlockedIPv4(groupsToIPv4(g6!, g7!));
   }
-  // 64:ff9b::/96 and 64:ff9b:1::/48 — NAT64 well-known and local-use prefixes.
-  if (g0 === 0x0064 && g1 === 0xff9b) {
+  // 64:ff9b::/96 — the NAT64 well-known prefix, and ONLY that. Matching all
+  // of 64:ff9b::/32 let 64:ff9b:2::808:808 unwrap to a public 8.8.8.8 and be
+  // allowed, even though the address itself belongs to no defined prefix and
+  // sits outside global unicast. Anything else under 64:ff9b:: falls through
+  // to the 2000::/3 test below and is refused.
+  if (g0 === 0x0064 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
     return isBlockedIPv4(groupsToIPv4(g6!, g7!));
   }
   // ::a.b.c.d — deprecated IPv4-compatible, still reaches v4.
@@ -159,8 +163,10 @@ function isBlockedIPv6(ip: string): boolean {
   if (g0 === 0x2001 && (g1! & 0xfff0) === 0x0020) return true;
   // 2001:db8::/32 — documentation.
   if (g0 === 0x2001 && g1 === 0x0db8) return true;
-  // 3fff::/20 — documentation (RFC 9637).
-  if ((g0! & 0xfff0) === 0x3ff0) return true;
+  // 3fff::/20 — documentation (RFC 9637). The first 20 bits are fixed, so
+  // g0 must equal 3fff and the top nibble of g1 must be zero. Masking g0
+  // alone implemented 3ff0::/12 and refused legitimate 3ff0–3ffe space.
+  if (g0 === 0x3fff && (g1! & 0xf000) === 0x0000) return true;
 
   return false;
 }
