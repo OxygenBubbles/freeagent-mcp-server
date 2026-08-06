@@ -163,7 +163,16 @@ export function registerTransactionTools(server: McpServer): void {
             .optional()
             .describe("URL of a receipt to download and attach (e.g. a Stripe 'Download invoice' link). The server fetches and encodes it — no need to handle bytes."),
         })
-        .strict(),
+        .strict()
+        .refine(
+          (a) =>
+            [a.fileBase64, a.filePath, a.fileUrl].filter(Boolean).length <= 1,
+          "Supply at most one of fileBase64, filePath or fileUrl — passing several silently ignores the rest."
+        )
+        .refine(
+          (a) => !a.fileBase64 || Boolean(a.fileName),
+          "fileBase64 requires fileName."
+        ),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,

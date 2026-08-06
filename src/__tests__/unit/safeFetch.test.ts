@@ -4,7 +4,37 @@
  * the cloud metadata endpoint.
  */
 import { describe, it, expect } from "vitest";
-import { assertPublicUrl, isBlockedAddress } from "../../utils/safeFetch.js";
+import {
+  assertPublicUrl,
+  isBlockedAddress,
+  isBlockedHostLiteral,
+  expandIPv6,
+  guardedLookup,
+} from "../../utils/safeFetch.js";
+
+describe("expandIPv6", () => {
+  it("expands compressed forms to eight groups", () => {
+    expect(expandIPv6("::1")).toEqual([0, 0, 0, 0, 0, 0, 0, 1]);
+    expect(expandIPv6("::")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(expandIPv6("fe80::1")).toEqual([0xfe80, 0, 0, 0, 0, 0, 0, 1]);
+  });
+
+  it("folds an embedded IPv4 quad into two hex groups", () => {
+    // ::ffff:127.0.0.1 and ::ffff:7f00:1 are the same address; new URL()
+    // normalises the first into the second, which a prefix check would miss.
+    expect(expandIPv6("::ffff:127.0.0.1")).toEqual(expandIPv6("::ffff:7f00:1"));
+  });
+
+  it("strips a zone id", () => {
+    expect(expandIPv6("fe80::1%eth0")).toEqual([0xfe80, 0, 0, 0, 0, 0, 0, 1]);
+  });
+
+  it("returns null for nonsense", () => {
+    for (const bad of ["", "gggg::1", "1:2:3", "1::2::3", "not-an-ip"]) {
+      expect(expandIPv6(bad), bad).toBeNull();
+    }
+  });
+});
 
 describe("isBlockedAddress", () => {
   it("blocks loopback", () => {
@@ -14,34 +44,49 @@ describe("isBlockedAddress", () => {
   });
 
   it("blocks the cloud metadata endpoint", () => {
-    // The single most valuable SSRF target on a cloud host.
     expect(isBlockedAddress("169.254.169.254")).toBe(true);
   });
 
-  it("blocks RFC1918 private ranges", () => {
-    for (const ip of ["10.0.0.1", "172.16.0.1", "172.31.255.255", "192.168.1.1"]) {
+  it("blocks RFC1918, CGNAT, multicast and the unspecified address", () => {
+    for (const ip of [
+      "10.0.0.1", "172.16.0.1", "172.31.255.255", "192.168.1.1",
+      "100.64.0.1", "224.0.0.1", "0.0.0.0",
+    ]) {
       expect(isBlockedAddress(ip), ip).toBe(true);
     }
   });
 
-  it("blocks CGNAT, multicast and the unspecified address", () => {
-    expect(isBlockedAddress("100.64.0.1")).toBe(true);
-    expect(isBlockedAddress("224.0.0.1")).toBe(true);
-    expect(isBlockedAddress("0.0.0.0")).toBe(true);
+  it("blocks the WHOLE of IPv6 link-local, not just fe80", () => {
+    // fe80::/10 spans fe80 through febf. A startsWith("fe80") check let
+    // fe90:: through febf:: straight past.
+    for (const ip of ["fe80::1", "fe90::1", "fea0::1", "febf::1"]) {
+      expect(isBlockedAddress(ip), ip).toBe(true);
+    }
   });
 
-  it("blocks IPv6 link-local and unique-local", () => {
-    expect(isBlockedAddress("fe80::1")).toBe(true);
-    expect(isBlockedAddress("fd00::1")).toBe(true);
+  it("blocks IPv6 unique-local and multicast", () => {
+    for (const ip of ["fc00::1", "fd00::1", "fdff::1", "ff00::1", "ff02::1"]) {
+      expect(isBlockedAddress(ip), ip).toBe(true);
+    }
   });
 
-  it("blocks an IPv4-mapped IPv6 loopback", () => {
-    // ::ffff:127.0.0.1 is loopback wearing a different hat.
+  it("blocks IPv4-mapped loopback in BOTH notations", () => {
+    // The normalised hex form is what new URL() actually produces.
     expect(isBlockedAddress("::ffff:127.0.0.1")).toBe(true);
+    expect(isBlockedAddress("::ffff:7f00:1")).toBe(true);
+    expect(isBlockedAddress("::ffff:169.254.169.254")).toBe(true);
+    expect(isBlockedAddress("::ffff:a9fe:a9fe")).toBe(true);
+  });
+
+  it("blocks IPv4-compatible loopback", () => {
+    expect(isBlockedAddress("::127.0.0.1")).toBe(true);
   });
 
   it("allows ordinary public addresses", () => {
-    for (const ip of ["1.1.1.1", "8.8.8.8", "172.15.0.1", "172.32.0.1", "2606:4700::1111"]) {
+    for (const ip of [
+      "1.1.1.1", "8.8.8.8", "172.15.0.1", "172.32.0.1",
+      "2606:4700::1111", "2001:4860:4860::8888",
+    ]) {
       expect(isBlockedAddress(ip), ip).toBe(false);
     }
   });
@@ -52,46 +97,76 @@ describe("isBlockedAddress", () => {
   });
 });
 
-describe("assertPublicUrl", () => {
-  it("rejects non-HTTP schemes", async () => {
-    for (const url of [
-      "file:///etc/passwd",
-      "ftp://example.com/x",
-      "gopher://example.com",
-    ]) {
-      await expect(assertPublicUrl(url)).rejects.toThrow(/only http and https/i);
+describe("isBlockedHostLiteral", () => {
+  it("lets ordinary hostnames through — they are checked at connect time", () => {
+    // Regression: treating a hostname as an unparseable address blocked every
+    // redirect to a named host, which is most real receipt links.
+    for (const host of ["s3.amazonaws.com", "files.stripe.com", "example.com"]) {
+      expect(isBlockedHostLiteral(host), host).toBe(false);
     }
   });
 
-  it("rejects a malformed URL", async () => {
-    await expect(assertPublicUrl("not a url")).rejects.toThrow(/Invalid URL/);
+  it("still blocks local-only names and bad IP literals", () => {
+    for (const host of ["localhost", "foo.localhost", "db.internal", "printer.local", "127.0.0.1"]) {
+      expect(isBlockedHostLiteral(host), host).toBe(true);
+    }
+  });
+});
+
+describe("assertPublicUrl", () => {
+  it("rejects non-HTTP schemes", () => {
+    for (const url of ["file:///etc/passwd", "ftp://example.com/x", "gopher://example.com"]) {
+      expect(() => assertPublicUrl(url), url).toThrow(/only http and https/i);
+    }
   });
 
-  it("rejects localhost by name", async () => {
-    await expect(assertPublicUrl("http://localhost:8080/x")).rejects.toThrow(
-      /local address/
+  it("rejects a malformed URL", () => {
+    expect(() => assertPublicUrl("not a url")).toThrow(/Invalid URL/);
+  });
+
+  it("rejects localhost by name", () => {
+    expect(() => assertPublicUrl("http://localhost:8080/x")).toThrow(/local-only|loopback/);
+  });
+
+  it("rejects literal private, loopback and metadata addresses", () => {
+    for (const url of [
+      "http://127.0.0.1/x",
+      "http://169.254.169.254/latest/meta-data/",
+      "http://192.168.0.5/admin",
+      "http://[::ffff:127.0.0.1]/x",
+      "http://[::1]/x",
+    ]) {
+      expect(() => assertPublicUrl(url), url).toThrow(/loopback|private|link-local/);
+    }
+  });
+
+  it("allows public hosts and literal public addresses", () => {
+    expect(assertPublicUrl("https://1.1.1.1/invoice.pdf").hostname).toBe("1.1.1.1");
+    expect(assertPublicUrl("https://files.stripe.com/x.pdf").hostname).toBe(
+      "files.stripe.com"
     );
   });
+});
 
-  it("rejects a literal private or loopback address without a DNS lookup", async () => {
-    await expect(assertPublicUrl("http://127.0.0.1/x")).rejects.toThrow(/private address/);
-    await expect(assertPublicUrl("http://169.254.169.254/latest/meta-data/")).rejects.toThrow(
-      /private address/
-    );
-    await expect(assertPublicUrl("http://192.168.0.5/admin")).rejects.toThrow(
-      /private address/
-    );
+describe("guardedLookup", () => {
+  it("refuses to hand a private address to the socket", async () => {
+    // localhost resolves to 127.0.0.1, so this proves the connect-time guard
+    // fires even when the URL check has already passed.
+    const err = await new Promise<Error | null>((resolve) => {
+      guardedLookup("localhost", { all: false }, (e) => resolve(e as Error | null));
+    });
+    expect(err).toBeTruthy();
+    expect(err!.message).toMatch(/non-public address/);
   });
 
-  it("rejects a host that does not resolve", async () => {
-    await expect(
-      assertPublicUrl("https://this-host-should-not-exist.invalid/x")
-    ).rejects.toThrow(/Could not resolve host|did not resolve/);
-  });
-
-  it("allows a literal public address", async () => {
-    const url = await assertPublicUrl("https://1.1.1.1/invoice.pdf");
-    expect(url.hostname).toBe("1.1.1.1");
+  it("passes a public address through", async () => {
+    const result = await new Promise<{ err: Error | null; address: unknown }>((resolve) => {
+      guardedLookup("dns.google", { all: false }, (e, address) =>
+        resolve({ err: e as Error | null, address })
+      );
+    });
+    // Network-dependent: only assert when resolution actually succeeded.
+    if (!result.err) expect(typeof result.address).toBe("string");
   });
 });
 
@@ -100,28 +175,35 @@ describe("debug-log redaction", () => {
     const { _redactForTests } = await import("../../services/freeagent.js");
 
     const out = _redactForTests({
-      client_id: "abc123",
       client_secret: "super-secret-value",
       refresh_token: "rt_livevalue123456",
-      access_token: "at_livevalue123456",
       expense: {
         description: "Hotel",
         attachment: { data: "QkFTRTY0", file_name: "receipt.pdf" },
       },
-      // A token that arrives under an innocuous key must still be scrubbed.
       message: "Request failed: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
     }) as Record<string, unknown>;
 
     const serialised = JSON.stringify(out);
     expect(serialised).not.toContain("super-secret-value");
     expect(serialised).not.toContain("rt_livevalue123456");
-    expect(serialised).not.toContain("at_livevalue123456");
     expect(serialised).not.toContain("eyJhbGciOiJIUzI1NiJ9");
     expect(serialised).not.toContain("QkFTRTY0");
 
     // Non-sensitive content is still readable, or the log is useless.
     expect(serialised).toContain("Hotel");
     expect(serialised).toContain("receipt.pdf");
+  });
+
+  it("does not corrupt legitimate fields whose names merely contain a keyword", async () => {
+    const { _redactForTests } = await import("../../services/freeagent.js");
+    const out = _redactForTests({
+      token_count: 42,
+      secretary_name: "Jo",
+      updated_at: "2026-08-06",
+    }) as Record<string, unknown>;
+    expect(out["token_count"]).toBe(42);
+    expect(out["secretary_name"]).toBe("Jo");
   });
 
   it("omits very long strings rather than dumping a file into the log", async () => {

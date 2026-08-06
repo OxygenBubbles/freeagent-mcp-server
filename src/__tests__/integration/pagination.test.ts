@@ -164,3 +164,51 @@ describe("faGetPaged", () => {
     expect(items).toHaveLength(120);
   });
 });
+
+describe("faGetPaged boundaries", () => {
+  it("does not claim more exists when the collection exactly fills the limit", async () => {
+    // Regression: stopping at the limit without probing reported
+    // mayHaveMore: true, so a report of exactly N records claimed "more than N".
+    vi.resetModules();
+    mockCollection("invoices", 100);
+    const { listInvoices } = await import("../../services/freeagent.js");
+
+    const { items, mayHaveMore } = await listInvoices({ limit: 100 });
+
+    expect(items).toHaveLength(100);
+    expect(mayHaveMore).toBe(false);
+  });
+
+  it("never returns more than the caller asked for, even while probing", async () => {
+    vi.resetModules();
+    mockCollection("invoices", 250);
+    const { listInvoices } = await import("../../services/freeagent.js");
+
+    const { items, mayHaveMore } = await listInvoices({ limit: 100 });
+
+    expect(items).toHaveLength(100);
+    expect(mayHaveMore).toBe(true);
+  });
+
+  it("handles a limit that is not a multiple of the page size", async () => {
+    vi.resetModules();
+    mockCollection("invoices", 250);
+    const { listInvoices } = await import("../../services/freeagent.js");
+
+    const { items, mayHaveMore } = await listInvoices({ limit: 137 });
+
+    expect(items).toHaveLength(137);
+    expect(mayHaveMore).toBe(true);
+  });
+
+  it("reports truncation rather than looping forever on a huge collection", async () => {
+    vi.resetModules();
+    mockCollection("invoices", 1_000_000);
+    const { listInvoices } = await import("../../services/freeagent.js");
+
+    const { items, mayHaveMore } = await listInvoices({ limit: 2000 });
+
+    expect(items).toHaveLength(2000);
+    expect(mayHaveMore).toBe(true);
+  }, 20_000);
+});

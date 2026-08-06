@@ -17,8 +17,14 @@ import {
   toMinorUnits,
   fromMinorUnits,
   responseMoneyToMinor,
+  requiredResponseMoneyToMinor,
 } from "../utils/money.js";
-import { assertPublicUrl, isBlockedAddress } from "../utils/safeFetch.js";
+import {
+  assertPublicUrl,
+  assertAllowedProtocol,
+  isBlockedHostLiteral,
+  guardedAgents,
+} from "../utils/safeFetch.js";
 import type {
   FreeAgentToken,
   BankAccount,
@@ -47,6 +53,21 @@ function debugEnabled(): boolean {
   const v = process.env.FREEAGENT_DEBUG;
   return v === "1" || v === "true";
 }
+
+/** Field names whose values are always secret, matched exactly. */
+const SECRET_KEYS = new Set([
+  "data", // base64 attachment payload
+  "authorization",
+  "password",
+  "access_token",
+  "refresh_token",
+  "api_token",
+  "auth_token",
+  "token",
+  "client_id",
+  "client_secret",
+  "secret",
+]);
 
 /** Patterns that look like credentials wherever they appear in a string. */
 const SECRET_PATTERNS: RegExp[] = [
@@ -77,7 +98,9 @@ function redact(value: unknown): unknown {
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (/token|secret|password|authorization|client_id|^data$/i.test(k)) {
+      // Exact key names only: a substring match redacted ordinary fields
+      // such as token_count and secretary_name, making the log misleading.
+      if (SECRET_KEYS.has(k.toLowerCase())) {
         out[k] = "<redacted>";
       } else {
         out[k] = redact(v);
@@ -228,17 +251,21 @@ async function faGetPaged<T>(
   limit: number
 ): Promise<PagedResult<T>> {
   const items: T[] = [];
-  let page = 1;
 
-  for (;;) {
-    const remaining = limit - items.length;
-    // Stopped on the caller's budget rather than the end of the collection.
-    if (remaining <= 0) return { items, mayHaveMore: true };
+  // Fetch one record beyond the caller's limit. Without it, a collection whose
+  // size exactly equals the limit reports mayHaveMore: true, and the ageing
+  // reports then claim "more than N exist" when N is the whole ledger.
+  const probeLimit = limit + 1;
 
-    const perPage = Math.min(API_MAX_PER_PAGE, remaining);
+  // per_page MUST stay constant for the whole run: FreeAgent's `page` is an
+  // offset in units of per_page, so shrinking the page for a final partial
+  // request re-reads the start of the collection instead of continuing it.
+  const pageSize = Math.min(API_MAX_PER_PAGE, Math.max(1, probeLimit));
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const data = await faGet<Record<string, unknown>>(path, {
       ...params,
-      per_page: perPage,
+      per_page: pageSize,
       page,
     });
     const batch = Array.isArray(data[collectionKey])
@@ -247,10 +274,17 @@ async function faGetPaged<T>(
     items.push(...batch);
 
     // A short page means the collection is exhausted.
-    if (batch.length < perPage) return { items, mayHaveMore: false };
-    if (page >= MAX_PAGES) return { items, mayHaveMore: true };
-    page++;
+    if (batch.length < pageSize) {
+      return { items: items.slice(0, limit), mayHaveMore: items.length > limit };
+    }
+    // Enough to know whether anything lies beyond the caller's limit.
+    if (items.length >= probeLimit) {
+      return { items: items.slice(0, limit), mayHaveMore: true };
+    }
   }
+
+  // Hit the page ceiling with a full final page — more may well exist.
+  return { items: items.slice(0, limit), mayHaveMore: true };
 }
 
 function faPut<T>(path: string, body: unknown): Promise<T> {
@@ -559,7 +593,9 @@ export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 export async function fetchUrlAsBase64(
   url: string
 ): Promise<{ base64: string; fileName?: string; contentType?: string }> {
-  await assertPublicUrl(url);
+  assertPublicUrl(url);
+
+  const { httpAgent, httpsAgent } = guardedAgents();
 
   const resp = await axios.get<ArrayBuffer>(url, {
     responseType: "arraybuffer",
@@ -568,13 +604,24 @@ export async function fetchUrlAsBase64(
     maxContentLength: MAX_DOWNLOAD_BYTES,
     maxBodyLength: MAX_DOWNLOAD_BYTES,
     headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" },
-    // Re-check each hop: the first host being public says nothing about where
-    // it redirects to.
+    // Every connection, including each redirect hop, resolves through a lookup
+    // that refuses non-public addresses — so the address validated is the
+    // address dialled, closing the rebinding window.
+    httpAgent,
+    httpsAgent,
+    // A redirect target is a HOSTNAME, not an IP, so it cannot be judged as an
+    // address here. Only the scheme and any literal-IP host are checked; names
+    // are handled by the guarded lookup above.
     beforeRedirect: (options) => {
-      const target = `${options.protocol}//${options.hostname}${options.path ?? ""}`;
-      const host = String(options.hostname ?? "").replace(/^\[|\]$/g, "");
-      if (isBlockedAddress(host)) {
-        throw new Error(`Refusing to follow a redirect to a non-public address: ${target}`);
+      const host = String(options.hostname ?? "");
+      assertAllowedProtocol(
+        String(options.protocol ?? ""),
+        `redirect target ${host}`
+      );
+      if (isBlockedHostLiteral(host)) {
+        throw new Error(
+          `Refusing to follow a redirect to ${host}: it is a loopback, link-local, private or local-only address.`
+        );
       }
     },
   });
@@ -883,7 +930,6 @@ export async function linkExpenseToEntry(opts: {
 export async function listContacts(opts: {
   view?: "all" | "active" | "clients" | "suppliers" | "hidden";
   limit?: number;
-  page?: number;
 } = {}): Promise<PagedResult<Contact>> {
   const params: Record<string, unknown> = {};
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
@@ -966,7 +1012,6 @@ export async function listInvoices(opts: {
   fromDate?: string;
   toDate?: string;
   limit?: number;
-  page?: number;
 } = {}): Promise<PagedResult<Invoice>> {
   const params: Record<string, unknown> = {};
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
@@ -1094,7 +1139,6 @@ export async function listBills(opts: {
   fromDate?: string;
   toDate?: string;
   limit?: number;
-  page?: number;
 } = {}): Promise<PagedResult<Bill>> {
   const params: Record<string, unknown> = {};
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
@@ -1376,7 +1420,9 @@ function parseDateOnly(value: string | undefined): number | null {
 
 export interface AgeingEntry {
   label: string;
-  dueValue: string;
+  /** Optional in the type so a missing value reaches the guard and throws
+   *  there, with the record named, rather than being defaulted at the callsite. */
+  dueValue: string | undefined;
   dueOn?: string;
   reference?: string;
 }
@@ -1413,7 +1459,10 @@ export function buildAgeingBuckets(
   let unknownDueDateCount = 0;
 
   const items = entries.map((entry) => {
-    const minor = responseMoneyToMinor(
+    // Missing is refused, not zeroed: a £12,000 invoice dropping out of the
+    // total because a field moved is exactly the failure this report exists
+    // to avoid.
+    const minor = requiredResponseMoneyToMinor(
       entry.dueValue,
       `outstanding value for "${entry.reference ?? entry.label}"`
     );

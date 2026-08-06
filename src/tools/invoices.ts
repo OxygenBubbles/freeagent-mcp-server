@@ -92,6 +92,9 @@ export function registerInvoiceTools(server: McpServer): void {
           // Named to make the scope explicit: this totals what was returned,
           // which is the whole set only when mayHaveMore is false.
           totalOutstandingForReturned: outstanding,
+          // Retained under the old name so an existing consumer keeps working;
+          // prefer the explicit one, which says what it actually covers.
+          totalOutstanding: outstanding,
           mayHaveMore,
           ...(mayHaveMore
             ? { warning: `More invoices exist beyond the ${args.limit} fetched — the total above is partial. Use freeagent_aged_debtors for a complete figure.` }

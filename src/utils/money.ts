@@ -47,7 +47,7 @@ export function fromMinorUnits(minor: number): string {
   if (!Number.isSafeInteger(minor)) {
     throw new Error(`Cannot format non-integer minor units: ${minor}`);
   }
-  const negative = minor < 0;
+  const negative = minor < 0; // -0 is not negative, so "-0.00" cannot occur
   const abs = Math.abs(minor);
   const formatted = `${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, "0")}`;
   return negative ? `-${formatted}` : formatted;
@@ -67,21 +67,61 @@ export function sumMoney(values: string[], label = "amount"): string {
  * Parse a money string that a FreeAgent response supplied.
  *
  * Responses use a looser format than requests — "-46.2", "35000", "0.0" — so
- * one decimal place is normalised up, but a non-numeric value still throws
- * rather than silently becoming zero.
+ * a single decimal place is padded. Parsing stays on the string: going via
+ * `Number(x) * 100` loses a penny at large values and silently re-rounds
+ * anything with more precision than it should have.
+ *
+ * A value with more than two decimal places is refused rather than rounded:
+ * FreeAgent stores money to two, so a third digit means the field is not what
+ * this function was pointed at, and rounding it would invent a number.
  */
-export function responseMoneyToMinor(value: string | undefined | null, label = "amount"): number {
+export function responseMoneyToMinor(
+  value: string | undefined | null,
+  label = "amount"
+): number {
   if (value === undefined || value === null || String(value).trim() === "") return 0;
   const trimmed = String(value).trim();
-  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) {
+
+  const m = /^(-?)(\d+)(?:\.(\d+))?$/.exec(trimmed);
+  if (!m) {
     throw new Error(`FreeAgent returned a ${label} that is not a number: "${value}".`);
   }
-  const asNumber = Number(trimmed);
-  const minor = Math.round(asNumber * 100);
+  const [, sign, whole, fraction = ""] = m;
+  if (fraction.length > 2) {
+    throw new Error(
+      `FreeAgent returned a ${label} with more precision than money should have: "${value}".`
+    );
+  }
+
+  const pence = fraction.padEnd(2, "0");
+  const wholeMinor = Number(whole) * 100;
+  if (!Number.isSafeInteger(wholeMinor)) {
+    throw new Error(`FreeAgent returned a ${label} too large to handle precisely: "${value}".`);
+  }
+  const minor = wholeMinor + Number(pence);
   if (!Number.isSafeInteger(minor)) {
     throw new Error(`FreeAgent returned a ${label} too large to handle precisely: "${value}".`);
   }
-  return minor;
+  return sign === "-" ? -minor : minor;
+}
+
+/**
+ * Like responseMoneyToMinor, but a missing value is an error rather than zero.
+ *
+ * Use this where absence cannot be meaningfully treated as nil — an open
+ * invoice with no outstanding value means the field moved or the record is not
+ * what was expected, and silently counting it as £0 understates the total.
+ */
+export function requiredResponseMoneyToMinor(
+  value: string | undefined | null,
+  label = "amount"
+): number {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    throw new Error(
+      `FreeAgent returned no ${label}. Refusing to treat a missing amount as zero.`
+    );
+  }
+  return responseMoneyToMinor(value, label);
 }
 
 /** Sum money values as they came back from FreeAgent, exactly. */

@@ -142,3 +142,40 @@ describe("isCalendarDate", () => {
     }
   });
 });
+
+describe("responseMoneyToMinor precision", () => {
+  it("is exact at large values where Number(x) * 100 drifts", async () => {
+    const { responseMoneyToMinor, fromMinorUnits } = await import("../../utils/money.js");
+    // Math.round(90071992547409.90 * 100) lands on 9007199254740991, which
+    // formats back as ...09.91 — a penny invented by floating point.
+    const minor = responseMoneyToMinor("90071992547409.90");
+    expect(fromMinorUnits(minor)).toBe("90071992547409.90");
+  });
+
+  it("refuses more precision than money has, rather than silently rounding", async () => {
+    const { responseMoneyToMinor } = await import("../../utils/money.js");
+    // "1.005" previously became "1.00" with no indication anything was lost.
+    expect(() => responseMoneyToMinor("1.005", "due value")).toThrow(/more precision/);
+  });
+
+  it("never produces negative zero", async () => {
+    const { responseMoneyToMinor, fromMinorUnits } = await import("../../utils/money.js");
+    expect(fromMinorUnits(responseMoneyToMinor("-0.00"))).toBe("0.00");
+  });
+
+  it("rejects a value too large to hold exactly", async () => {
+    const { responseMoneyToMinor } = await import("../../utils/money.js");
+    expect(() => responseMoneyToMinor("999999999999999999999")).toThrow(/too large/);
+  });
+});
+
+describe("requiredResponseMoneyToMinor", () => {
+  it("refuses a missing amount instead of counting it as zero", async () => {
+    const { requiredResponseMoneyToMinor } = await import("../../utils/money.js");
+    for (const missing of [undefined, null, "", "   "]) {
+      expect(() => requiredResponseMoneyToMinor(missing, "due value")).toThrow(
+        /Refusing to treat a missing amount as zero/
+      );
+    }
+  });
+});

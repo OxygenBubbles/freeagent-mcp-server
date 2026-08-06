@@ -11,9 +11,7 @@ import {
 } from "../services/freeagent.js";
 import { REPORT_MAX_RECORDS } from "../constants.js";
 import { sumResponseMoney } from "../utils/money.js";
-import { ok, fail } from "./respond.js";
-
-const DATE = /^\d{4}-\d{2}-\d{2}$/;
+import { ok, fail, dateSchema } from "./respond.js";
 
 /**
  * The date to age against.
@@ -43,10 +41,10 @@ export function registerReportTools(server: McpServer): void {
         "Defaults to the current accounting year.",
       inputSchema: z
         .object({
-          fromDate: z.string().regex(DATE).optional()
-            .describe("Period start YYYY-MM-DD (default: start of the current accounting year)"),
-          toDate: z.string().regex(DATE).optional()
-            .describe("Period end YYYY-MM-DD (default: today)"),
+          fromDate: dateSchema(
+            "Period start YYYY-MM-DD (default: start of the current accounting year)"
+          ).optional(),
+          toDate: dateSchema("Period end YYYY-MM-DD (default: today)").optional(),
         })
         .strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
@@ -74,8 +72,7 @@ export function registerReportTools(server: McpServer): void {
         "Credits are negative, debits positive. Useful for a full financial position.",
       inputSchema: z
         .object({
-          asAt: z.string().regex(DATE).optional()
-            .describe("Balance date YYYY-MM-DD (default: today)"),
+          asAt: dateSchema("Balance date YYYY-MM-DD (default: today)").optional(),
           nonZeroOnly: z.boolean().default(true)
             .describe("Omit accounts with a zero balance (default true)"),
         })
@@ -119,11 +116,7 @@ export function registerReportTools(server: McpServer): void {
         "(not yet due, 1-30, 31-60, 61-90, 90+ days). Shows who owes what and for how long.",
       inputSchema: z
         .object({
-          asAt: z
-            .string()
-            .regex(DATE)
-            .optional()
-            .describe("Age against this date YYYY-MM-DD (default: today)"),
+          asAt: dateSchema("Age against this date YYYY-MM-DD (default: today)").optional(),
         })
         .strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
@@ -141,7 +134,7 @@ export function registerReportTools(server: McpServer): void {
             label: i.contact_name ?? i.contact,
             reference: i.reference,
             dueOn: i.due_on,
-            dueValue: i.due_value ?? "0",
+            dueValue: i.due_value,
           })),
           args.asAt ?? localToday()
         );
@@ -171,11 +164,7 @@ export function registerReportTools(server: McpServer): void {
         "Shows what the company owes and for how long.",
       inputSchema: z
         .object({
-          asAt: z
-            .string()
-            .regex(DATE)
-            .optional()
-            .describe("Age against this date YYYY-MM-DD (default: today)"),
+          asAt: dateSchema("Age against this date YYYY-MM-DD (default: today)").optional(),
         })
         .strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
@@ -191,7 +180,7 @@ export function registerReportTools(server: McpServer): void {
             label: b.contact,
             reference: b.reference,
             dueOn: b.due_on,
-            dueValue: b.due_value ?? "0",
+            dueValue: b.due_value,
           })),
           args.asAt ?? localToday()
         );

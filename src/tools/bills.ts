@@ -77,6 +77,9 @@ export function registerBillTools(server: McpServer): void {
           bills: rows,
           count: rows.length,
           totalOutstandingForReturned: outstanding,
+          // Retained under the old name so an existing consumer keeps working;
+          // prefer the explicit one, which says what it actually covers.
+          totalOutstanding: outstanding,
           mayHaveMore,
           ...(mayHaveMore
             ? { warning: `More bills exist beyond the ${args.limit} fetched — the total above is partial. Use freeagent_aged_creditors for a complete figure.` }

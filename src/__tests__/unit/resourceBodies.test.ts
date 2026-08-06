@@ -340,3 +340,16 @@ describe("page size ceiling", () => {
     expect(DEFAULT_PAGE_SIZE).toBeLessThanOrEqual(MAX_PAGE_SIZE);
   });
 });
+
+describe("ageing refuses missing amounts", () => {
+  it("throws rather than dropping an invoice with no outstanding value", () => {
+    // Silently treating this as £0 is how a real receivable vanishes from a
+    // report while the report still looks plausible.
+    expect(() =>
+      buildAgeingBuckets(
+        [{ label: "Acme", reference: "INV-9", dueOn: "2026-08-01", dueValue: undefined }],
+        "2026-08-06"
+      )
+    ).toThrow(/Refusing to treat a missing amount as zero/);
+  });
+});

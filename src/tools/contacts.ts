@@ -36,9 +36,12 @@ export function registerContactTools(server: McpServer): void {
             .number()
             .int()
             .positive()
-            .max(100)
-            .default(50)
-            .describe("Maximum contacts to return (default 50, max 100)"),
+            .max(1000)
+            .default(100)
+            .describe(
+              "Maximum contacts to fetch (default 100, max 1000). The server pages " +
+              "through as many requests as needed; `search` is applied to everything fetched."
+            ),
         })
         .strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
@@ -75,7 +78,7 @@ export function registerContactTools(server: McpServer): void {
           // contact gets created.
           mayHaveMore,
           ...(mayHaveMore
-            ? { warning: `More contacts exist beyond the ${args.limit} fetched. Raise limit or narrow the view.` }
+            ? { warning: `More than the ${args.limit} contacts fetched exist; a search may have missed a match. Raise limit (up to 1000) to widen the sweep.` }
             : {}),
         });
       } catch (err) {

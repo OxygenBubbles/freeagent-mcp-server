@@ -11,6 +11,7 @@ import {
 import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE } from "../constants.js";
 import { inferContentType } from "../utils/contentType.js";
 import { parseAmount, addDays } from "../utils/amount.js";
+import { parseStrictDecimal } from "../utils/money.js";
 import { lookupCategory } from "../utils/vendorCategories.js";
 import { dateSchema } from "./respond.js";
 
@@ -264,20 +265,28 @@ export function registerExpenseTools(server: McpServer): void {
           const fromDate = addDays(args.datedOn, -DATE_TOLERANCE_DAYS);
           const toDate = addDays(args.datedOn, DATE_TOLERANCE_DAYS);
 
+          // The window is narrow, but a busy account can hold more than a
+          // page of unexplained rows in it; under-fetching silently reported
+          // "no match" and left a standalone claim.
           const transactions = await listBankTransactions({
             bankAccountId: args.bankAccountId,
             view: "unexplained",
             fromDate,
             toDate,
-            limit: 100,
+            limit: 500,
           });
 
           const amount = parseAmount(args.grossAmount, "grossAmount");
           const upperVendor = args.vendor.toUpperCase();
 
           const match = transactions.find((t) => {
-            const txAmount = parseFloat(t.amount);
-            if (!Number.isFinite(txAmount)) return false;
+            // Strict: a permissive parse could match the wrong transaction.
+            let txAmount: number;
+            try {
+              txAmount = parseStrictDecimal(t.amount, "bank transaction amount");
+            } catch {
+              return false;
+            }
             const amountMatch = Math.abs(Math.abs(txAmount) - amount) <= AMOUNT_TOLERANCE;
             const descMatch =
               upperVendor.length >= MIN_VENDOR_MATCH_LEN &&
