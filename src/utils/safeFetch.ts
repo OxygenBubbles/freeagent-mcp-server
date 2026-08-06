@@ -155,13 +155,17 @@ function isBlockedIPv6(ip: string): boolean {
 
   // 2002::/16 — 6to4 carries its IPv4 address in the next two groups.
   if (g0 === 0x2002) return isBlockedIPv4(groupsToIPv4(g1!, g2!));
-  // 2001:0000::/32 — Teredo. The client address is obfuscated; refuse outright.
-  if (g0 === 0x2001 && g1 === 0x0000) return true;
-  // 2001:2::/48 — benchmarking.
-  if (g0 === 0x2001 && g1 === 0x0002 && g2 === 0x0000) return true;
-  // 2001:20::/28 — ORCHIDv2 (2001:0020 through 2001:002f).
-  if (g0 === 0x2001 && (g1! & 0xfff0) === 0x0020) return true;
-  // 2001:db8::/32 — documentation.
+
+  // 2001::/23 — IANA IETF Protocol Assignments, none of it globally
+  // reachable. One rule covers Teredo (2001::/32), benchmarking (2001:2::/48),
+  // AMT (2001:3::/32), AS112-v6 (2001:4:112::/48), ORCHIDv2 (2001:20::/28)
+  // and Drone Remote ID (2001:30::/28). Enumerating them individually left
+  // 2001:100::1 and the rest of the /23 reachable. A /23 fixes the top 7 bits
+  // of the second group, so g1 <= 0x01ff. Real allocations such as
+  // 2001:4860:: (Google) have a far larger g1 and are unaffected.
+  if (g0 === 0x2001 && g1! <= 0x01ff) return true;
+
+  // 2001:db8::/32 — documentation. Outside the /23 above, so still needed.
   if (g0 === 0x2001 && g1 === 0x0db8) return true;
   // 3fff::/20 — documentation (RFC 9637). The first 20 bits are fixed, so
   // g0 must equal 3fff and the top nibble of g1 must be zero. Masking g0

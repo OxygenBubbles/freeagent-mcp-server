@@ -87,7 +87,19 @@ const BENIGN_KEYS = new Set([
  * separator at all — "clientsecret" and "apikey" are single segments, so
  * segment matching alone let them through.
  */
-const SECRET_SUBSTRINGS = ["secret", "password", "passwd", "apikey", "credential", "token"];
+const SECRET_SUBSTRINGS = [
+  "secret", "password", "passwd", "apikey", "credential", "token",
+  // "key" alone is too broad (monkey, keyboard), so the compounds are listed.
+  "privatekey", "privkey", "secretkey", "signingkey", "accesskey",
+];
+
+/**
+ * Words that merely CONTAIN a secret word without being one. Stripped before
+ * the substring pass so secretary_email and passwordless_enabled stay in the
+ * log — over-redaction is not a security problem, but it does hide state a
+ * person is trying to debug.
+ */
+const BENIGN_SUBSTRINGS = /secretar(y|ies|ial)|passwordless|tokenis|tokeniz/g;
 
 function isSecretKey(key: string): boolean {
   const lower = key.toLowerCase();
@@ -100,11 +112,15 @@ function isSecretKey(key: string): boolean {
     ? lower.split(/[_\-.]/)
     : key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[_\-.]/);
   if (segments.some((segment) => SECRET_SEGMENTS.has(segment))) return true;
-  return SECRET_SUBSTRINGS.some((word) => lower.includes(word));
+  const stripped = lower.replace(BENIGN_SUBSTRINGS, "");
+  return SECRET_SUBSTRINGS.some((word) => stripped.includes(word));
 }
 
 /** Patterns that look like credentials wherever they appear in a string. */
 const SECRET_PATTERNS: RegExp[] = [
+  // Everything after a PEM header is key material, so consume to the end of
+  // the value rather than stopping lazily at the header.
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*/g,
   /\bBearer\s+[A-Za-z0-9._~+/-]{8,}=*/gi,
   /\b(?:access|refresh|api|auth)[_-]?token["'\s:=]+[A-Za-z0-9._~+/-]{8,}/gi,
   /\bclient[_-]?secret["'\s:=]+[A-Za-z0-9._~+/-]{8,}/gi,

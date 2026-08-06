@@ -127,6 +127,24 @@ describe("isBlockedAddress", () => {
     expect(isBlockedAddress("64:ff9b::808:808")).toBe(false); // the real /96
   });
 
+  it("blocks the whole of 2001::/23 (IETF protocol assignments)", () => {
+    // Enumerating Teredo/benchmarking/ORCHID individually left the rest of
+    // the /23 reachable — 2001:100::1 sailed through every exclusion.
+    for (const ip of [
+      "2001::1", "2001:1::1", "2001:2::1", "2001:3::1",
+      "2001:4:112::1", "2001:20::1", "2001:30::1", "2001:100::1", "2001:1ff::1",
+    ]) {
+      expect(isBlockedAddress(ip), ip).toBe(true);
+    }
+    expect(isBlockedAddress("2001:db8::1")).toBe(true); // documentation, outside the /23
+  });
+
+  it("leaves real 2001:: allocations reachable", () => {
+    // The /23 stops at 2001:01ff::, well below any real assignment.
+    expect(isBlockedAddress("2001:200::1")).toBe(false);
+    expect(isBlockedAddress("2001:4860:4860::8888")).toBe(false); // Google
+  });
+
   it("scopes the 3fff::/20 documentation block to exactly /20", () => {
     // Masking g0 alone implemented 3ff0::/12 and refused 3ff0-3ffe, which is
     // ordinary global unicast.
@@ -302,6 +320,29 @@ describe("debug-log redaction", () => {
       })
     );
     for (let i = 1; i <= 4; i++) expect(out, `LEAK${i}`).not.toContain(`LEAK${i}`);
+  });
+
+  it("redacts private-key material by key name and by PEM content", async () => {
+    const { _redactForTests } = await import("../../services/freeagent.js");
+    const out = JSON.stringify(
+      _redactForTests({
+        privatekey: "-----BEGIN PRIVATE KEY-----LEAK1",
+        privkey: "LEAK2",
+        // A PEM block under an innocuous key is still key material.
+        note: "-----BEGIN RSA PRIVATE KEY-----LEAK3",
+      })
+    );
+    for (let i = 1; i <= 3; i++) expect(out, `LEAK${i}`).not.toContain(`LEAK${i}`);
+  });
+
+  it("does not over-redact words that merely contain a secret word", async () => {
+    const { _redactForTests } = await import("../../services/freeagent.js");
+    const out = _redactForTests({
+      secretary_email: "user@example.com",
+      passwordless_enabled: true,
+    }) as Record<string, unknown>;
+    expect(out["secretary_email"]).toBe("user@example.com");
+    expect(out["passwordless_enabled"]).toBe(true);
   });
 
   it("leaves structural keys containing a secret word readable", async () => {
