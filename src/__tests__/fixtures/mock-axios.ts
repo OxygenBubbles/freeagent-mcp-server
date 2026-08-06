@@ -63,8 +63,17 @@ export function mockFreeAgentAxios(fixture: Fixture): MockedFreeAgentAxios {
       return { data: { bank_transactions: txs } } as never;
     }
 
+    // Real shape: four parallel arrays, not a flat "categories" list.
     if (pathname.endsWith("/categories")) {
-      return { data: { categories: fixture.categories } } as never;
+      return { data: fixture.categories } as never;
+    }
+
+    if (pathname.endsWith("/users/me")) {
+      return { data: { user: fixture.user } } as never;
+    }
+
+    if (pathname.endsWith("/projects")) {
+      return { data: { projects: fixture.projects } } as never;
     }
 
     throw new Error(`mockFreeAgentAxios: unmapped GET ${pathname}`);

@@ -3,21 +3,27 @@ import { z } from "zod";
 import {
   createExpense,
   listCategories,
+  listProjects,
   listBankTransactions,
   linkExpenseToEntry,
-  uploadAttachment,
   handleFAError,
 } from "../services/freeagent.js";
-import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE } from "../constants.js";
+import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE_PENCE } from "../constants.js";
 import { inferContentType } from "../utils/contentType.js";
 import { parseAmount, addDays } from "../utils/amount.js";
+import { findMatchingTransactions, decideLink } from "../utils/matchTransaction.js";
 import { lookupCategory } from "../utils/vendorCategories.js";
+import { dateSchema } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
 
-// Category path must be /v2/categories/<numeric-id>
-const CATEGORY_PATH_REGEX = /^\/v2\/categories\/\d+$/;
+// Category reference: the "/v2/categories/<id>" path form or the full API URL.
+const CATEGORY_PATH_REGEX =
+  /^(?:https:\/\/api\.freeagent\.com)?\/v2\/categories\/\d+$/;
+
+// Project reference: the "/v2/projects/<id>" path form or the full API URL.
+const PROJECT_PATH_REGEX = /^(?:https:\/\/api\.freeagent\.com)?\/v2\/projects\/\d+$/;
 
 // Minimum vendor string length for fuzzy bank transaction matching
 const MIN_VENDOR_MATCH_LEN = 3;
@@ -44,7 +50,10 @@ export function registerExpenseTools(server: McpServer): void {
           url: c.url,
           description: c.description,
           nominal_code: c.nominal_code,
-          group: c.group ?? null,
+          group: c.group_description ?? c.group ?? null,
+          category_type: c.category_type ?? null,
+          allowable_for_tax: c.allowable_for_tax ?? null,
+          auto_sales_tax_rate: c.auto_sales_tax_rate ?? null,
         }));
         return {
           content: [
@@ -54,6 +63,49 @@ export function registerExpenseTools(server: McpServer): void {
             },
           ],
           structuredContent: { categories: rows, count: rows.length },
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: handleFAError(err) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ── List projects ───────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_list_projects",
+    {
+      description:
+        "List FreeAgent projects. Returns project URL, name, status and contact. " +
+        "Use the project URL to tag an expense to a client engagement via freeagent_create_expense.",
+      inputSchema: z
+        .object({
+          view: z
+            .enum(["active", "completed", "cancelled", "all"])
+            .default("active")
+            .describe("Which projects to return (default: active)"),
+        })
+        .strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+    async (args) => {
+      try {
+        const { items, mayHaveMore } = await listProjects(args.view);
+        const rows = items.map((p) => ({
+          url: p.url,
+          id: p.id,
+          name: p.name,
+          status: p.status,
+          contact: p.contact ?? null,
+          currency: p.currency ?? null,
+        }));
+        const payload = { projects: rows, count: rows.length, mayHaveMore };
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          structuredContent: payload,
         };
       } catch (err) {
         return {
@@ -83,17 +135,14 @@ export function registerExpenseTools(server: McpServer): void {
             .min(1)
             .max(200)
             .describe("Vendor / merchant name (e.g. 'IONOS Cloud')"),
-          datedOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Expense date YYYY-MM-DD"),
+          datedOn: dateSchema("Expense date YYYY-MM-DD"),
           grossAmount: z
             .string()
-            .min(1)
-            .refine(
-              (val) => Number.isFinite(parseFloat(val)) && parseFloat(val) > 0,
-              "Must be a valid positive number (e.g. '22.80')"
+            .regex(
+              /^\d+(\.\d{1,2})?$/,
+              "Positive amount with at most 2 decimal places, e.g. '22.80'"
             )
+            .refine((v) => Number(v) > 0, "Must be greater than zero")
             .describe("Gross amount as string (e.g. '22.80')"),
           description: z
             .string()
@@ -102,11 +151,15 @@ export function registerExpenseTools(server: McpServer): void {
             .describe("Expense description (e.g. 'Monthly cloud hosting')"),
           currency: z
             .string()
-            .length(3)
+            .regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP")
             .default("GBP")
             .describe("ISO 4217 currency code (default GBP)"),
           vatAmount: z
             .string()
+            .regex(
+              /^\d+(\.\d{1,2})?$/,
+              "Positive amount with at most 2 decimal places, e.g. '3.80'"
+            )
             .optional()
             .describe("VAT amount as string (e.g. '3.80')"),
           categoryUrl: z
@@ -114,6 +167,14 @@ export function registerExpenseTools(server: McpServer): void {
             .regex(CATEGORY_PATH_REGEX, "Must be a FreeAgent category path like /v2/categories/285")
             .optional()
             .describe("FreeAgent category URL (e.g. '/v2/categories/285'). Auto-selected from vendor if omitted."),
+          project: z
+            .string()
+            .regex(PROJECT_PATH_REGEX, "Must be a FreeAgent project path like /v2/projects/123")
+            .optional()
+            .describe(
+              "FreeAgent project URL (e.g. '/v2/projects/123') to tag the expense against, " +
+              "so it can be rebilled or reported per client. Use freeagent_list_projects to find it."
+            ),
           fileBase64: z
             .string()
             .max(FILE_BASE64_MAX, "File must be under ~7.5 MB (10 MB base64)")
@@ -135,7 +196,11 @@ export function registerExpenseTools(server: McpServer): void {
               "(same amount, date ±4 days) and link the expense to it."
             ),
         })
-        .strict(),
+        .strict()
+        .refine(
+          (a) => Boolean(a.fileBase64) === Boolean(a.fileName),
+          "Supply both fileBase64 and fileName, or neither — a lone value would be silently dropped."
+        ),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -167,6 +232,17 @@ export function registerExpenseTools(server: McpServer): void {
           };
         }
 
+        // Attach the receipt inline on create, so a rejected attachment fails
+        // the whole call rather than leaving a receiptless expense behind.
+        const attachment =
+          args.fileBase64 && args.fileName
+            ? {
+                fileName: args.fileName,
+                contentType: args.contentType ?? inferContentType(args.fileName),
+                fileBase64: args.fileBase64,
+              }
+            : undefined;
+
         // Create expense
         const expense = await createExpense({
           categoryUrl,
@@ -175,22 +251,13 @@ export function registerExpenseTools(server: McpServer): void {
           grossValue: args.grossAmount,
           currency: args.currency,
           manualSalesTaxAmount: args.vatAmount,
+          projectUrl: args.project,
+          attachment,
         });
 
         const actions: string[] = [`Expense created (${expense.id})`];
-
-        // Attach receipt if provided
-        if (args.fileBase64 && args.fileName) {
-          const ct = args.contentType ?? inferContentType(args.fileName);
-          await uploadAttachment({
-            entityId: expense.id,
-            entityType: "expense",
-            fileName: args.fileName,
-            contentType: ct,
-            fileBase64: args.fileBase64,
-          });
-          actions.push(`Receipt attached: ${args.fileName}`);
-        }
+        if (attachment) actions.push(`Receipt attached: ${attachment.fileName}`);
+        if (args.project) actions.push(`Tagged to project ${args.project}`);
 
         // Auto-match bank transaction if requested
         let matchedEntryId: string | null = null;
@@ -198,36 +265,56 @@ export function registerExpenseTools(server: McpServer): void {
           const fromDate = addDays(args.datedOn, -DATE_TOLERANCE_DAYS);
           const toDate = addDays(args.datedOn, DATE_TOLERANCE_DAYS);
 
-          const transactions = await listBankTransactions({
+          // The window is narrow, but a busy account can hold more than a
+          // page of unexplained rows in it; under-fetching silently reported
+          // "no match" and left a standalone claim.
+          const { items: transactions, mayHaveMore: moreCandidates } =
+            await listBankTransactions({
             bankAccountId: args.bankAccountId,
             view: "unexplained",
             fromDate,
             toDate,
-            limit: 100,
-          });
+            limit: 500,
+            });
 
           const amount = parseAmount(args.grossAmount, "grossAmount");
           const upperVendor = args.vendor.toUpperCase();
 
-          const match = transactions.find((t) => {
-            const txAmount = parseFloat(t.amount);
-            if (!Number.isFinite(txAmount)) return false;
-            const amountMatch = Math.abs(Math.abs(txAmount) - amount) <= AMOUNT_TOLERANCE;
-            const descMatch =
-              upperVendor.length >= MIN_VENDOR_MATCH_LEN &&
-              t.description.toUpperCase().includes(upperVendor);
-            return amountMatch && descMatch;
+          const matches = findMatchingTransactions(transactions, {
+            amount: args.grossAmount,
+            vendor: args.vendor,
+            tolerancePence: AMOUNT_TOLERANCE_PENCE,
+            minVendorLength: MIN_VENDOR_MATCH_LEN,
           });
+          const decision = decideLink(matches, moreCandidates);
 
-          if (match) {
+          if (decision.action === "link") {
             await linkExpenseToEntry({
-              entryId: match.id,
+              entryId: decision.match.id,
               expenseUrl: expense.url,
             });
-            matchedEntryId = match.id;
-            actions.push(`Linked to bank transaction ${match.id} (${match.description}, ${match.amount})`);
+            matchedEntryId = decision.match.id;
+            actions.push(
+              `Linked to bank transaction ${decision.match.id} (${decision.match.description}, ${decision.match.amount})`
+            );
+          } else if (decision.action === "ambiguous") {
+            actions.push(
+              `Not linked: ${decision.matches.length} bank transactions match (${decision.matches
+                .map((m) => `${m.id} ${m.dated_on} ${m.amount}`)
+                .join("; ")}). Link the right one manually.`
+            );
+          } else if (decision.action === "incomplete") {
+            actions.push(
+              `Not linked: found one match (${decision.matches[0]!.id}) but more unexplained transactions exist beyond the ${transactions.length} searched, so it may not be the only candidate. Confirm manually.`
+            );
           } else {
-            actions.push("No matching bank transaction found — expense stands alone as a claim");
+            // "No match" over a truncated candidate set reads as "no such
+            // transaction exists", and the user files a duplicate.
+            actions.push(
+              moreCandidates
+                ? `No match in the first ${transactions.length} unexplained transactions in the date window, but more exist — expense stands alone as a claim; check manually`
+                : "No matching bank transaction found — expense stands alone as a claim"
+            );
           }
         }
 

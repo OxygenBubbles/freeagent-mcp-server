@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { createExpense, handleFAError } from "../services/freeagent.js";
+import { createMileageExpense, handleFAError } from "../services/freeagent.js";
 import {
   calculateDistance,
   isDistanceConfigured,
@@ -14,9 +14,12 @@ import {
   HMRC_RATE_LOW_PENCE,
   HMRC_THRESHOLD_MILES,
 } from "../constants.js";
+import { dateSchema } from "./respond.js";
 
+// 249 is "Mileage" in FreeAgent's standard chart of accounts. The previous
+// default (311) does not exist there, so every mileage claim was rejected.
 function getMileageCategoryUrl(): string {
-  return process.env.MILEAGE_CATEGORY_URL ?? "/v2/categories/311";
+  return process.env.MILEAGE_CATEGORY_URL ?? "/v2/categories/249";
 }
 
 function getDefaultRate(): number | null {
@@ -57,16 +60,12 @@ export function registerMileageTools(server: McpServer): void {
         "Create a mileage expense in FreeAgent. " +
         "Provide either origin + destination (requires ORS_API_KEY or GOOGLE_MAPS_API_KEY for distance lookup) " +
         "or manualMiles for the journey distance. Set roundTrip=true to double the distance.\n\n" +
-        "Rate: pass ratePence to set the per-mile rate explicitly (e.g. 45 for 45p/mile). " +
-        "If omitted, defaults to the MILEAGE_RATE_PENCE env var, or HMRC approved rates " +
-        "(configurable via HMRC_RATE_HIGH_PENCE / HMRC_RATE_LOW_PENCE / HMRC_THRESHOLD_MILES env vars, " +
-        "defaulting to 45p/25p at 10,000 miles — pass cumulativeMilesYTD to enable threshold logic).",
+        "The claim value is calculated by FreeAgent from the mileage rate configured on the account " +
+        "(this is what HMRC reporting in FreeAgent uses). ratePence / cumulativeMilesYTD only produce " +
+        "an advisory estimate in the response for cross-checking — they do not change what is filed.",
       inputSchema: z
         .object({
-          datedOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Journey date YYYY-MM-DD"),
+          datedOn: dateSchema("Journey date YYYY-MM-DD"),
           description: z
             .string()
             .min(1)
@@ -96,9 +95,21 @@ export function registerMileageTools(server: McpServer): void {
             .positive()
             .optional()
             .describe(
-              "Pence per mile (e.g. 45). If omitted, uses MILEAGE_RATE_PENCE env var " +
-              "or HMRC rates (configurable via env vars, defaults to 45p/25p with threshold logic)."
+              "Pence per mile (e.g. 45) used only for the advisory estimate in the response. " +
+              "FreeAgent applies the mileage rate configured on the account when filing the claim."
             ),
+          vehicleType: z
+            .enum(["Car", "Motorcycle", "Bicycle"])
+            .default("Car")
+            .describe("Vehicle used for the journey (required by FreeAgent's mileage category)"),
+          project: z
+            .string()
+            .regex(
+              /^(?:https:\/\/api\.freeagent\.com)?\/v2\/projects\/\d+$/,
+              "Must be a FreeAgent project path like /v2/projects/123"
+            )
+            .optional()
+            .describe("FreeAgent project URL to tag the journey against"),
           cumulativeMilesYTD: z
             .number()
             .min(0)
@@ -110,7 +121,7 @@ export function registerMileageTools(server: McpServer): void {
             ),
           currency: z
             .string()
-            .length(3)
+            .regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP")
             .default("GBP")
             .describe("ISO 4217 currency code (default GBP)"),
         })
@@ -162,111 +173,82 @@ export function registerMileageTools(server: McpServer): void {
           journeyDetail += " (round trip)";
         }
 
-        // ── Calculate rate and amount ─────────────────────────────────────
-        let amountPounds: string;
+        // ── Advisory estimate ─────────────────────────────────────────────
+        // FreeAgent computes the actual claim from the account's own mileage
+        // rate. This estimate is returned alongside it so a mismatch with the
+        // caller's expectation (or HMRC AMAP rates) is visible.
+        let estimatePounds: string;
         let breakdown: string;
         let ratePence: number | undefined;
 
-        if (args.ratePence) {
-          // Explicit rate
-          ratePence = args.ratePence;
-          const amountPence = Math.round(miles * ratePence);
-          amountPounds = (amountPence / 100).toFixed(2);
-          breakdown = `${miles} miles @ ${ratePence}p/mile`;
+        const explicitRate = args.ratePence ?? getDefaultRate();
+        if (explicitRate) {
+          ratePence = explicitRate;
+          estimatePounds = (Math.round(miles * ratePence) / 100).toFixed(2);
+          breakdown =
+            `${miles} miles @ ${ratePence}p/mile` +
+            (args.ratePence ? "" : " (MILEAGE_RATE_PENCE)");
         } else {
-          const envRate = getDefaultRate();
-          if (envRate) {
-            // Env var flat rate
-            ratePence = envRate;
-            const amountPence = Math.round(miles * ratePence);
-            amountPounds = (amountPence / 100).toFixed(2);
-            breakdown = `${miles} miles @ ${ratePence}p/mile (MILEAGE_RATE_PENCE)`;
-          } else {
-            // HMRC threshold logic — load configurable rates once
-            const rates = getHMRCRates();
-            const cumulative = args.cumulativeMilesYTD ?? 0;
-            const calc = calculateHMRCMileage(miles, cumulative, rates);
-            amountPounds = calc.amountPounds;
-            breakdown = calc.breakdown;
-
-            if (calc.type === "split") {
-              const expense = await createExpense({
-                categoryUrl: getMileageCategoryUrl(),
-                datedOn: args.datedOn,
-                description: `[MILEAGE] [${miles} miles] ${args.description} — ${journeyDetail}. ${calc.highMiles} mi @ ${rates.highPence}p + ${calc.lowMiles} mi @ ${rates.lowPence}p (crosses ${rates.thresholdMiles.toLocaleString()}-mile threshold)`,
-                grossValue: amountPounds,
-                currency: args.currency,
-              });
-
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify(
-                      {
-                        success: true,
-                        expenseId: expense.id,
-                        miles,
-                        amount: amountPounds,
-                        breakdown,
-                        journey: journeyDetail,
-                        cumulativeMilesAfter: cumulative + miles,
-                      },
-                      null,
-                      2
-                    ),
-                  },
-                ],
-                structuredContent: {
-                  success: true,
-                  expenseId: expense.id,
-                  miles,
-                  amount: amountPounds,
-                },
-              };
-            }
-
-            if (calc.type === "single") {
-              ratePence = calc.ratePence;
-            }
-          }
+          const rates = getHMRCRates();
+          const calc = calculateHMRCMileage(
+            miles,
+            args.cumulativeMilesYTD ?? 0,
+            rates
+          );
+          estimatePounds = calc.amountPounds;
+          breakdown = calc.breakdown;
+          if (calc.type === "single") ratePence = calc.ratePence;
         }
 
-        const expense = await createExpense({
+        // ── File the claim ────────────────────────────────────────────────
+        const expense = await createMileageExpense({
           categoryUrl: getMileageCategoryUrl(),
           datedOn: args.datedOn,
-          description: `[MILEAGE] [${miles} miles] ${args.description} — ${journeyDetail}. ${breakdown!}`,
-          grossValue: amountPounds!,
+          description: `${args.description} — ${journeyDetail}`,
+          miles,
+          vehicleType: args.vehicleType,
           currency: args.currency,
+          projectUrl: args.project,
         });
 
+        // FreeAgent records claims as negative (money owed to the claimant).
+        const filedAmount = expense.gross_value;
+        const filedMagnitude = Math.abs(parseFloat(filedAmount)).toFixed(2);
+        const notes: string[] = [];
+        if (filedMagnitude !== estimatePounds) {
+          notes.push(
+            `FreeAgent filed £${filedMagnitude} using the mileage rate configured on the account; ` +
+            `the estimate from ${breakdown} was £${estimatePounds}.`
+          );
+        }
+
+        const payload = {
+          success: true,
+          expenseId: expense.id,
+          expenseUrl: expense.url,
+          miles,
+          vehicleType: args.vehicleType,
+          amount: filedAmount,
+          rateApplied: expense.reclaim_mileage_rate ?? null,
+          estimate: estimatePounds,
+          estimateBasis: breakdown,
+          estimateRatePence: ratePence,
+          journey: journeyDetail,
+          project: args.project ?? null,
+          cumulativeMilesAfter:
+            args.cumulativeMilesYTD === undefined
+              ? undefined
+              : args.cumulativeMilesYTD + miles,
+          notes,
+        };
+
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  success: true,
-                  expenseId: expense.id,
-                  miles,
-                  ratePence,
-                  amount: amountPounds,
-                  breakdown,
-                  journey: journeyDetail,
-                  cumulativeMilesAfter: args.cumulativeMilesYTD
-                    ? args.cumulativeMilesYTD + miles
-                    : undefined,
-                },
-                null,
-                2
-              ),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
           structuredContent: {
             success: true,
             expenseId: expense.id,
             miles,
-            amount: amountPounds,
+            amount: filedAmount,
           },
         };
       } catch (err) {

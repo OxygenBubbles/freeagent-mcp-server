@@ -11,6 +11,7 @@ import {
   handleFAError,
 } from "../services/freeagent.js";
 import { inferContentType } from "../utils/contentType.js";
+import { dateSchema } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
@@ -40,23 +41,15 @@ export function registerTransactionTools(server: McpServer): void {
             .enum(["unexplained", "explained", "all", "marked_for_review", "manual", "imported"])
             .default("unexplained")
             .describe("Which transactions to return. Defaults to unexplained. Use 'marked_for_review' for auto-categorised transactions awaiting approval."),
-          fromDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .optional()
-            .describe("Start date filter YYYY-MM-DD (inclusive)"),
-          toDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .optional()
-            .describe("End date filter YYYY-MM-DD (inclusive)"),
+          fromDate: dateSchema("Start date filter YYYY-MM-DD (inclusive)").optional(),
+          toDate: dateSchema("End date filter YYYY-MM-DD (inclusive)").optional(),
           limit: z
             .number()
             .int()
             .min(1)
-            .max(200)
+            .max(100)
             .default(50)
-            .describe("Max entries to return (default 50, max 200)"),
+            .describe("Max entries to return (default 50, max 100)"),
           page: z
             .number()
             .int()
@@ -69,7 +62,7 @@ export function registerTransactionTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const transactions = await listBankTransactions({
+        const { items: transactions, mayHaveMore } = await listBankTransactions({
           bankAccountId: args.bankAccountId,
           view: args.view,
           fromDate: args.fromDate,
@@ -94,14 +87,10 @@ export function registerTransactionTools(server: McpServer): void {
           };
         });
 
+        const payload = { transactions: rows, count: rows.length, mayHaveMore };
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ transactions: rows, count: rows.length }, null, 2),
-            },
-          ],
-          structuredContent: { transactions: rows, count: rows.length },
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          structuredContent: payload,
         };
       } catch (err) {
         return {
@@ -170,7 +159,16 @@ export function registerTransactionTools(server: McpServer): void {
             .optional()
             .describe("URL of a receipt to download and attach (e.g. a Stripe 'Download invoice' link). The server fetches and encodes it — no need to handle bytes."),
         })
-        .strict(),
+        .strict()
+        .refine(
+          (a) =>
+            [a.fileBase64, a.filePath, a.fileUrl].filter(Boolean).length <= 1,
+          "Supply at most one of fileBase64, filePath or fileUrl."
+        )
+        .refine(
+          (a) => !a.fileBase64 || Boolean(a.fileName),
+          "fileBase64 requires fileName."
+        ),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,

@@ -40,7 +40,7 @@ describe("Scenario: list bank accounts", () => {
 describe("Scenario: list transactions filters by view", () => {
   it("returns only unexplained when view=unexplained", async () => {
     const { listBankTransactions } = await import("../../services/freeagent.js");
-    const txs = await listBankTransactions({ bankAccountId: "1000001", view: "unexplained" });
+    const { items: txs } = await listBankTransactions({ bankAccountId: "1000001", view: "unexplained" });
 
     expect(txs.length).toBeGreaterThan(0);
     expect(txs.every((t) => !t.bank_transaction_explanations?.[0]?.category)).toBe(true);
@@ -48,7 +48,7 @@ describe("Scenario: list transactions filters by view", () => {
 
   it("returns only marked-for-review when view=marked_for_review", async () => {
     const { listBankTransactions } = await import("../../services/freeagent.js");
-    const txs = await listBankTransactions({
+    const { items: txs } = await listBankTransactions({
       bankAccountId: "1000001",
       view: "marked_for_review",
     });
@@ -61,7 +61,7 @@ describe("Scenario: list transactions filters by view", () => {
 
   it("extracts numeric IDs from both transactions and their explanations", async () => {
     const { listBankTransactions } = await import("../../services/freeagent.js");
-    const txs = await listBankTransactions({ bankAccountId: "1000001" });
+    const { items: txs } = await listBankTransactions({ bankAccountId: "1000001" });
 
     for (const t of txs) {
       expect(t.id).toMatch(/^\d+$/);
@@ -97,7 +97,7 @@ describe("Scenario: approve a marked-for-review transaction", () => {
         explanationId: "9000001",
         category: "../../../evil",
       })
-    ).rejects.toThrow(/Invalid category path/);
+    ).rejects.toThrow(/Invalid category/);
 
     expect(mock.state.explanationUpdates).toHaveLength(0);
   });
@@ -140,6 +140,9 @@ describe("Scenario: list categories (cached)", () => {
 
     expect(categories.length).toBeGreaterThan(0);
     expect(categories.map((c) => c.nominal_code)).toContain("285");
-    expect(categories.map((c) => c.nominal_code)).toContain("311");
+    expect(categories.map((c) => c.nominal_code)).toContain("249");
+    // All four category groups must be flattened, not just admin expenses.
+    expect(categories.map((c) => c.nominal_code)).toContain("150");
+    expect(categories.map((c) => c.nominal_code)).toContain("001");
   });
 });

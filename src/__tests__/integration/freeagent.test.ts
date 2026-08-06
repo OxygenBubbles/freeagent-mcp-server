@@ -114,7 +114,7 @@ describe("extractId (via public API)", () => {
       },
     } as never);
 
-    const result = await fa.listBankTransactions({ bankAccountId: "1" });
+    const { items: result } = await fa.listBankTransactions({ bankAccountId: "1" });
 
     expect(result[0]!.id).toBe("999");
     expect(result[0]!.bank_transaction_explanations![0]!.id).toBe("555");
@@ -159,7 +159,7 @@ describe("Category path validation", () => {
         explanationId: "123",
         category: "../../../etc/passwd",
       })
-    ).rejects.toThrow(/Invalid category path/);
+    ).rejects.toThrow(/Invalid category/);
 
     // No PUT should have fired — we rejected before the network call.
     expect(mockedPut).not.toHaveBeenCalled();
@@ -198,7 +198,7 @@ describe("Category path validation", () => {
         description: "Test",
         grossValue: "22.80",
       })
-    ).rejects.toThrow(/Invalid category path/);
+    ).rejects.toThrow(/Invalid category/);
   });
 });
 

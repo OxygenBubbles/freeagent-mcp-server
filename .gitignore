@@ -6,6 +6,9 @@ coverage/
 .mcp.json
 .mcp.json.bak
 
+# Local code-review artefacts (Codex output etc.) — keep them off the public repo
+.codex/
+
 # User-local design / planning documents
 *.docx
 ~$*
