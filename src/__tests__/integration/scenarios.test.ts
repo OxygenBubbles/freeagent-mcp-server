@@ -40,7 +40,7 @@ describe("Scenario: list bank accounts", () => {
 describe("Scenario: list transactions filters by view", () => {
   it("returns only unexplained when view=unexplained", async () => {
     const { listBankTransactions } = await import("../../services/freeagent.js");
-    const txs = await listBankTransactions({ bankAccountId: "1000001", view: "unexplained" });
+    const { items: txs } = await listBankTransactions({ bankAccountId: "1000001", view: "unexplained" });
 
     expect(txs.length).toBeGreaterThan(0);
     expect(txs.every((t) => !t.bank_transaction_explanations?.[0]?.category)).toBe(true);
@@ -48,7 +48,7 @@ describe("Scenario: list transactions filters by view", () => {
 
   it("returns only marked-for-review when view=marked_for_review", async () => {
     const { listBankTransactions } = await import("../../services/freeagent.js");
-    const txs = await listBankTransactions({
+    const { items: txs } = await listBankTransactions({
       bankAccountId: "1000001",
       view: "marked_for_review",
     });
@@ -61,7 +61,7 @@ describe("Scenario: list transactions filters by view", () => {
 
   it("extracts numeric IDs from both transactions and their explanations", async () => {
     const { listBankTransactions } = await import("../../services/freeagent.js");
-    const txs = await listBankTransactions({ bankAccountId: "1000001" });
+    const { items: txs } = await listBankTransactions({ bankAccountId: "1000001" });
 
     for (const t of txs) {
       expect(t.id).toMatch(/^\d+$/);

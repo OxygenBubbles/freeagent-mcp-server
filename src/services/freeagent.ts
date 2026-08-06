@@ -54,20 +54,28 @@ function debugEnabled(): boolean {
   return v === "1" || v === "true";
 }
 
-/** Field names whose values are always secret, matched exactly. */
-const SECRET_KEYS = new Set([
-  "data", // base64 attachment payload
-  "authorization",
-  "password",
-  "access_token",
-  "refresh_token",
-  "api_token",
-  "auth_token",
-  "token",
-  "client_id",
-  "client_secret",
-  "secret",
+/**
+ * Key segments that mean the value is a credential.
+ *
+ * Matching whole segments rather than substrings keeps `secretary_name` and
+ * `token_count` readable, while still catching the many shapes a secret
+ * arrives under — api_key, oauth_token, stripe_secret_key, private_key.
+ */
+const SECRET_SEGMENTS = new Set([
+  "secret", "secrets", "password", "passwd", "pwd",
+  "token", "tokens", "key", "keys", "apikey",
+  "credential", "credentials", "authorization", "auth", "bearer", "signature",
 ]);
+
+/** Suffixes that describe a secret rather than being one. */
+const DESCRIPTIVE_SUFFIX = /_(count|type|name|at|on|url|id|length|size|expires_in)$/;
+
+function isSecretKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  if (lower === "data") return true; // base64 attachment payload
+  if (DESCRIPTIVE_SUFFIX.test(lower)) return false;
+  return lower.split(/[_\-.]/).some((segment) => SECRET_SEGMENTS.has(segment));
+}
 
 /** Patterns that look like credentials wherever they appear in a string. */
 const SECRET_PATTERNS: RegExp[] = [
@@ -100,7 +108,7 @@ function redact(value: unknown): unknown {
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       // Exact key names only: a substring match redacted ordinary fields
       // such as token_count and secretary_name, making the log misleading.
-      if (SECRET_KEYS.has(k.toLowerCase())) {
+      if (isSecretKey(k)) {
         out[k] = "<redacted>";
       } else {
         out[k] = redact(v);
@@ -402,7 +410,7 @@ export async function listBankTransactions(opts: {
   toDate?: string;
   limit?: number;
   page?: number;
-}): Promise<BankTransaction[]> {
+}): Promise<PagedResult<BankTransaction>> {
   const params: Record<string, unknown> = {
     bank_account: `${FA_API_BASE}/bank_accounts/${assertNumericId(
       opts.bankAccountId,
@@ -414,6 +422,7 @@ export async function listBankTransactions(opts: {
   if (opts.toDate) params["to_date"] = opts.toDate;
 
   let batch: BankTransaction[];
+  let mayHaveMore = false;
   if (opts.page !== undefined) {
     // Explicit page: return just that page.
     const data = await faGet<{ bank_transactions: BankTransaction[] }>(
@@ -425,6 +434,7 @@ export async function listBankTransactions(opts: {
       }
     );
     batch = data.bank_transactions ?? [];
+    mayHaveMore = batch.length >= Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
   } else {
     // No page given: page through so a match beyond the first 100 is still found.
     const paged = await faGetPaged<BankTransaction>(
@@ -434,9 +444,10 @@ export async function listBankTransactions(opts: {
       opts.limit ?? DEFAULT_LIST_LIMIT
     );
     batch = paged.items;
+    mayHaveMore = paged.mayHaveMore;
   }
 
-  return batch.map((t) => ({
+  const rows = batch.map((t) => ({
     ...t,
     id: extractId(t),
     bank_transaction_explanations: (t.bank_transaction_explanations ?? []).map((e) => ({
@@ -444,6 +455,8 @@ export async function listBankTransactions(opts: {
       id: extractId(e),
     })),
   }));
+
+  return { items: rows, mayHaveMore };
 }
 
 // ── Explain / update a bank transaction explanation ──────────────────────────
@@ -609,6 +622,11 @@ export async function fetchUrlAsBase64(
     // address dialled, closing the rebinding window.
     httpAgent,
     httpsAgent,
+    // Never proxy an untrusted URL. With HTTP_PROXY/HTTPS_PROXY/ALL_PROXY set,
+    // axios dials the PROXY and passes the destination on as an absolute URL,
+    // so the guarded lookup would validate the proxy and the proxy would
+    // happily fetch the private destination on our behalf.
+    proxy: false,
     // A redirect target is a HOSTNAME, not an IP, so it cannot be judged as an
     // address here. Only the scheme and any literal-IP host are checked; names
     // are handled by the guarded lookup above.

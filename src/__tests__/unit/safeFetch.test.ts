@@ -82,6 +82,26 @@ describe("isBlockedAddress", () => {
     expect(isBlockedAddress("::127.0.0.1")).toBe(true);
   });
 
+  it("blocks IPv6 transition formats that smuggle a private IPv4 destination", () => {
+    // Each of these is a globally-shaped or unusual address carrying a private
+    // IPv4 target. Enumerating "bad" prefixes missed all of them; only
+    // allowing global unicast, then unwrapping 6to4, catches them.
+    expect(isBlockedAddress("::ffff:0:127.0.0.1")).toBe(true); // IPv4-translatable
+    expect(isBlockedAddress("64:ff9b::127.0.0.1")).toBe(true); // NAT64
+    expect(isBlockedAddress("2002:7f00:1::")).toBe(true); // 6to4 wrapping 127.0.0.1
+    expect(isBlockedAddress("2002:c0a8:1::")).toBe(true); // 6to4 wrapping 192.168.0.1
+    expect(isBlockedAddress("2002:a9fe:a9fe::")).toBe(true); // 6to4 wrapping metadata
+    expect(isBlockedAddress("2001:0:1234::1")).toBe(true); // Teredo
+  });
+
+  it("still allows 6to4 wrapping a genuinely public IPv4 address", () => {
+    expect(isBlockedAddress("2002:0808:0808::")).toBe(false); // 8.8.8.8
+  });
+
+  it("rejects an address with a ':: ' that compresses nothing", () => {
+    expect(expandIPv6("1:2:3:4:5:6:7:8::")).toBeNull();
+  });
+
   it("allows ordinary public addresses", () => {
     for (const ip of [
       "1.1.1.1", "8.8.8.8", "172.15.0.1", "172.32.0.1",
@@ -210,5 +230,19 @@ describe("debug-log redaction", () => {
     const { _redactForTests } = await import("../../services/freeagent.js");
     const out = _redactForTests({ note: "x".repeat(1000) }) as Record<string, string>;
     expect(out["note"]).toMatch(/chars omitted/);
+  });
+});
+
+describe("proxy handling", () => {
+  it("never proxies an untrusted download", async () => {
+    // With HTTP_PROXY set, axios dials the PROXY and passes the destination on
+    // as an absolute URL — so the lookup guard would validate the proxy and the
+    // proxy would fetch the private destination for us. proxy:false is the only
+    // thing standing between that and an SSRF.
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync("src/services/freeagent.ts", "utf8");
+    const fetchFn = source.slice(source.indexOf("export async function fetchUrlAsBase64"));
+    const body = fetchFn.slice(0, fetchFn.indexOf("\n}\n"));
+    expect(body).toContain("proxy: false");
   });
 });

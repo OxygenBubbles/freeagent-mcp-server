@@ -85,42 +85,49 @@ export function expandIPv6(input: string): number[] | null {
   if (tail === null) return null;
 
   const missing = 8 - head.length - tail.length;
-  if (missing < 0) return null;
+  // "::" must stand for at least one omitted group, so a full eight groups
+  // either side of it is not a valid address.
+  if (missing < 1) return null;
   return [...head, ...Array(missing).fill(0), ...tail];
 }
 
+/** Render two 16-bit groups as a dotted IPv4 quad. */
+function groupsToIPv4(hi: number, lo: number): string {
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
+/**
+ * Classify an IPv6 address.
+ *
+ * This is an ALLOWLIST: everything outside global unicast (2000::/3) is
+ * refused. Enumerating bad prefixes kept missing things — ::ffff:0:127.0.0.1
+ * (IPv4-translatable) and 64:ff9b::127.0.0.1 (NAT64) both carry a private IPv4
+ * destination while looking nothing like the classic mapped form. Allowing only
+ * global unicast rejects all of those by construction, and the few transition
+ * formats that ARE globally shaped are unwrapped and judged on the IPv4 address
+ * they embed.
+ */
 function isBlockedIPv6(ip: string): boolean {
   const groups = expandIPv6(ip);
   if (groups === null) return true; // unparseable — refuse
 
-  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups as number[];
+  const [g0, g1, g2, , , , g6, g7] = groups as number[];
 
-  // Unspecified (::) and loopback (::1).
-  if (groups.every((g) => g === 0)) return true;
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && g7 === 1) {
-    return true;
-  }
+  // Anything outside 2000::/3 (global unicast) is refused. That covers ::,
+  // ::1, ::ffff:*/96, ::ffff:0:*/96, 64:ff9b::/96, fc00::/7, fe80::/10 and
+  // ff00::/8 without needing a rule for each.
+  if ((g0! & 0xe000) !== 0x2000) return true;
 
-  // IPv4-mapped ::ffff:0:0/96 — judge the embedded IPv4 address.
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
-    const a = (g6! >> 8) & 0xff, b = g6! & 0xff;
-    const c = (g7! >> 8) & 0xff, d = g7! & 0xff;
-    return isBlockedIPv4(`${a}.${b}.${c}.${d}`);
-  }
-  // IPv4-compatible ::a.b.c.d (deprecated, still routable to v4).
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && (g6 !== 0 || g7 !== 0)) {
-    const a = (g6! >> 8) & 0xff, b = g6! & 0xff;
-    const c = (g7! >> 8) & 0xff, d = g7! & 0xff;
-    return isBlockedIPv4(`${a}.${b}.${c}.${d}`);
-  }
+  // 2002::/16 — 6to4 carries its IPv4 address in the next two groups.
+  if (g0 === 0x2002) return isBlockedIPv4(groupsToIPv4(g1!, g2!));
 
-  // fe80::/10 — link-local spans fe80 through febf, not just fe80.
-  if ((g0! & 0xffc0) === 0xfe80) return true;
-  // fc00::/7 — unique local (fc00–fdff).
-  if ((g0! & 0xfe00) === 0xfc00) return true;
-  // ff00::/8 — multicast.
-  if ((g0! & 0xff00) === 0xff00) return true;
+  // 2001:0000::/32 — Teredo tunnelling. The client address is obfuscated in
+  // the last two groups; refuse the whole prefix rather than chase it.
+  if (g0 === 0x2001 && g1 === 0x0000) return true;
 
+  // Discard-only prefix 100::/64 is outside 2000::/3 and already refused.
+  void g6;
+  void g7;
   return false;
 }
 

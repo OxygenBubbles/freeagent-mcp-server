@@ -7,7 +7,6 @@ import { describe, it, expect } from "vitest";
 import {
   toMinorUnits,
   fromMinorUnits,
-  sumMoney,
   sumResponseMoney,
   responseMoneyToMinor,
   parseStrictDecimal,
@@ -72,26 +71,6 @@ describe("fromMinorUnits", () => {
   });
 });
 
-describe("sumMoney", () => {
-  it("sums exactly where floating point would drift", () => {
-    // 0.1 + 0.2 === 0.30000000000000004 as a JS number.
-    expect(sumMoney(["0.10", "0.20"])).toBe("0.30");
-  });
-
-  it("stays exact over many additions", () => {
-    const pennies = Array.from({ length: 1000 }, () => "0.01");
-    expect(sumMoney(pennies)).toBe("10.00");
-  });
-
-  it("handles an empty list", () => {
-    expect(sumMoney([])).toBe("0.00");
-  });
-
-  it("propagates a malformed entry rather than skipping it", () => {
-    expect(() => sumMoney(["1.00", "oops"])).toThrow(/Invalid amount/);
-  });
-});
-
 describe("responseMoneyToMinor", () => {
   it("accepts the looser formats FreeAgent returns", () => {
     expect(responseMoneyToMinor("-46.2")).toBe(-4620);
@@ -113,8 +92,12 @@ describe("responseMoneyToMinor", () => {
 });
 
 describe("sumResponseMoney", () => {
-  it("totals a mix of present and absent values exactly", () => {
-    expect(sumResponseMoney(["1200.50", undefined, "99.5", null])).toBe("1300.00");
+  it("totals present values exactly and counts the absent ones", () => {
+    // The absent entries must not vanish into the total as zero.
+    expect(sumResponseMoney(["1200.50", undefined, "99.5", null])).toEqual({
+      total: "1300.00",
+      missing: 2,
+    });
   });
 });
 

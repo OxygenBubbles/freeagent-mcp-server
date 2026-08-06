@@ -69,7 +69,7 @@ export function registerBillTools(server: McpServer): void {
           total_value: b.total_value,
           due_value: b.due_value ?? null,
         }));
-        const outstanding = sumResponseMoney(
+        const { total: outstanding, missing: missingDueValues } = sumResponseMoney(
           rows.map((r) => r.due_value),
           "bill due value"
         );
@@ -77,6 +77,9 @@ export function registerBillTools(server: McpServer): void {
           bills: rows,
           count: rows.length,
           totalOutstandingForReturned: outstanding,
+          // Records whose outstanding value was absent are excluded from the
+          // total above and counted here, rather than silently read as zero.
+          missingDueValues,
           // Retained under the old name so an existing consumer keeps working;
           // prefer the explicit one, which says what it actually covers.
           totalOutstanding: outstanding,

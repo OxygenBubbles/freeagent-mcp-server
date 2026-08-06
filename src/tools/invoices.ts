@@ -82,7 +82,7 @@ export function registerInvoiceTools(server: McpServer): void {
           paid_value: i.paid_value ?? null,
           due_value: i.due_value ?? null,
         }));
-        const outstanding = sumResponseMoney(
+        const { total: outstanding, missing: missingDueValues } = sumResponseMoney(
           rows.map((r) => r.due_value),
           "invoice due value"
         );
@@ -92,6 +92,9 @@ export function registerInvoiceTools(server: McpServer): void {
           // Named to make the scope explicit: this totals what was returned,
           // which is the whole set only when mayHaveMore is false.
           totalOutstandingForReturned: outstanding,
+          // Records whose outstanding value was absent are excluded from the
+          // total above and counted here, rather than silently read as zero.
+          missingDueValues,
           // Retained under the old name so an existing consumer keeps working;
           // prefer the explicit one, which says what it actually covers.
           totalOutstanding: outstanding,

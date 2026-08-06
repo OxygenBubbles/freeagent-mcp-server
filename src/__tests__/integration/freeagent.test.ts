@@ -114,7 +114,7 @@ describe("extractId (via public API)", () => {
       },
     } as never);
 
-    const result = await fa.listBankTransactions({ bankAccountId: "1" });
+    const { items: result } = await fa.listBankTransactions({ bankAccountId: "1" });
 
     expect(result[0]!.id).toBe("999");
     expect(result[0]!.bank_transaction_explanations![0]!.id).toBe("555");

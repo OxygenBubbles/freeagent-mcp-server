@@ -62,7 +62,7 @@ export function registerTransactionTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const transactions = await listBankTransactions({
+        const { items: transactions, mayHaveMore } = await listBankTransactions({
           bankAccountId: args.bankAccountId,
           view: args.view,
           fromDate: args.fromDate,
@@ -87,14 +87,10 @@ export function registerTransactionTools(server: McpServer): void {
           };
         });
 
+        const payload = { transactions: rows, count: rows.length, mayHaveMore };
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ transactions: rows, count: rows.length }, null, 2),
-            },
-          ],
-          structuredContent: { transactions: rows, count: rows.length },
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          structuredContent: payload,
         };
       } catch (err) {
         return {
@@ -167,7 +163,7 @@ export function registerTransactionTools(server: McpServer): void {
         .refine(
           (a) =>
             [a.fileBase64, a.filePath, a.fileUrl].filter(Boolean).length <= 1,
-          "Supply at most one of fileBase64, filePath or fileUrl — passing several silently ignores the rest."
+          "Supply at most one of fileBase64, filePath or fileUrl."
         )
         .refine(
           (a) => !a.fileBase64 || Boolean(a.fileName),

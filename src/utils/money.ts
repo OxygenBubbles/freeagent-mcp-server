@@ -54,16 +54,6 @@ export function fromMinorUnits(minor: number): string {
 }
 
 /**
- * Sum money strings exactly, returning a 2dp decimal string.
- * `label` names the field in any error raised for a malformed entry.
- */
-export function sumMoney(values: string[], label = "amount"): string {
-  let total = 0;
-  for (const value of values) total += toMinorUnits(value, label);
-  return fromMinorUnits(total);
-}
-
-/**
  * Parse a money string that a FreeAgent response supplied.
  *
  * Responses use a looser format than requests — "-46.2", "35000", "0.0" — so
@@ -124,14 +114,27 @@ export function requiredResponseMoneyToMinor(
   return responseMoneyToMinor(value, label);
 }
 
-/** Sum money values as they came back from FreeAgent, exactly. */
+/**
+ * Sum money values as they came back from FreeAgent, exactly.
+ *
+ * Absent values are counted rather than quietly folded in as zero: a total
+ * that skipped three records without saying so is a wrong number wearing a
+ * confident face. Callers surface `missing` alongside the total.
+ */
 export function sumResponseMoney(
   values: Array<string | undefined | null>,
   label = "amount"
-): string {
+): { total: string; missing: number } {
   let total = 0;
-  for (const value of values) total += responseMoneyToMinor(value, label);
-  return fromMinorUnits(total);
+  let missing = 0;
+  for (const value of values) {
+    if (value === undefined || value === null || String(value).trim() === "") {
+      missing++;
+      continue;
+    }
+    total += responseMoneyToMinor(value, label);
+  }
+  return { total: fromMinorUnits(total), missing };
 }
 
 /** Strict positive-decimal parse for non-money quantities such as hours. */

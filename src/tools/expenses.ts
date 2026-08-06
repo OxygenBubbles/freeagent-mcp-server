@@ -268,13 +268,14 @@ export function registerExpenseTools(server: McpServer): void {
           // The window is narrow, but a busy account can hold more than a
           // page of unexplained rows in it; under-fetching silently reported
           // "no match" and left a standalone claim.
-          const transactions = await listBankTransactions({
+          const { items: transactions, mayHaveMore: moreCandidates } =
+            await listBankTransactions({
             bankAccountId: args.bankAccountId,
             view: "unexplained",
             fromDate,
             toDate,
             limit: 500,
-          });
+            });
 
           const amount = parseAmount(args.grossAmount, "grossAmount");
           const upperVendor = args.vendor.toUpperCase();
@@ -302,7 +303,14 @@ export function registerExpenseTools(server: McpServer): void {
             matchedEntryId = match.id;
             actions.push(`Linked to bank transaction ${match.id} (${match.description}, ${match.amount})`);
           } else {
-            actions.push("No matching bank transaction found — expense stands alone as a claim");
+            // Say what was actually searched. "No match" over a truncated
+            // candidate set reads as "no such transaction exists", and the
+            // user files a duplicate.
+            actions.push(
+              moreCandidates
+                ? `No match in the first ${transactions.length} unexplained transactions in the date window, but more exist — expense stands alone as a claim; check manually`
+                : "No matching bank transaction found — expense stands alone as a claim"
+            );
           }
         }
 

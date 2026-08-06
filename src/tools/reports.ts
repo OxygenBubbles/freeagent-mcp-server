@@ -90,7 +90,7 @@ export function registerReportTools(server: McpServer): void {
             total: e.total,
             category: e.category,
           }));
-        const sum = sumResponseMoney(
+        const { total: sum } = sumResponseMoney(
           rows.map((r) => r.total),
           "trial balance total"
         );
