@@ -14,6 +14,7 @@ import {
   HMRC_RATE_LOW_PENCE,
   HMRC_THRESHOLD_MILES,
 } from "../constants.js";
+import { dateSchema } from "./respond.js";
 
 // 249 is "Mileage" in FreeAgent's standard chart of accounts. The previous
 // default (311) does not exist there, so every mileage claim was rejected.
@@ -64,10 +65,7 @@ export function registerMileageTools(server: McpServer): void {
         "an advisory estimate in the response for cross-checking — they do not change what is filed.",
       inputSchema: z
         .object({
-          datedOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Journey date YYYY-MM-DD"),
+          datedOn: dateSchema("Journey date YYYY-MM-DD"),
           description: z
             .string()
             .min(1)
@@ -123,7 +121,7 @@ export function registerMileageTools(server: McpServer): void {
             ),
           currency: z
             .string()
-            .length(3)
+            .regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP")
             .default("GBP")
             .describe("ISO 4217 currency code (default GBP)"),
         })
@@ -237,9 +235,10 @@ export function registerMileageTools(server: McpServer): void {
           estimateRatePence: ratePence,
           journey: journeyDetail,
           project: args.project ?? null,
-          cumulativeMilesAfter: args.cumulativeMilesYTD
-            ? args.cumulativeMilesYTD + miles
-            : undefined,
+          cumulativeMilesAfter:
+            args.cumulativeMilesYTD === undefined
+              ? undefined
+              : args.cumulativeMilesYTD + miles,
           notes,
         };
 

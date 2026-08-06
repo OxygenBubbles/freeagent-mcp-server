@@ -12,6 +12,7 @@ import { DATE_TOLERANCE_DAYS, AMOUNT_TOLERANCE } from "../constants.js";
 import { inferContentType } from "../utils/contentType.js";
 import { parseAmount, addDays } from "../utils/amount.js";
 import { lookupCategory } from "../utils/vendorCategories.js";
+import { dateSchema } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
@@ -91,8 +92,8 @@ export function registerExpenseTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const projects = await listProjects(args.view);
-        const rows = projects.map((p) => ({
+        const { items, mayHaveMore } = await listProjects(args.view);
+        const rows = items.map((p) => ({
           url: p.url,
           id: p.id,
           name: p.name,
@@ -100,14 +101,10 @@ export function registerExpenseTools(server: McpServer): void {
           contact: p.contact ?? null,
           currency: p.currency ?? null,
         }));
+        const payload = { projects: rows, count: rows.length, mayHaveMore };
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ projects: rows, count: rows.length }, null, 2),
-            },
-          ],
-          structuredContent: { projects: rows, count: rows.length },
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          structuredContent: payload,
         };
       } catch (err) {
         return {
@@ -137,17 +134,14 @@ export function registerExpenseTools(server: McpServer): void {
             .min(1)
             .max(200)
             .describe("Vendor / merchant name (e.g. 'IONOS Cloud')"),
-          datedOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Expense date YYYY-MM-DD"),
+          datedOn: dateSchema("Expense date YYYY-MM-DD"),
           grossAmount: z
             .string()
-            .min(1)
-            .refine(
-              (val) => Number.isFinite(parseFloat(val)) && parseFloat(val) > 0,
-              "Must be a valid positive number (e.g. '22.80')"
+            .regex(
+              /^\d+(\.\d{1,2})?$/,
+              "Positive amount with at most 2 decimal places, e.g. '22.80'"
             )
+            .refine((v) => Number(v) > 0, "Must be greater than zero")
             .describe("Gross amount as string (e.g. '22.80')"),
           description: z
             .string()
@@ -156,11 +150,15 @@ export function registerExpenseTools(server: McpServer): void {
             .describe("Expense description (e.g. 'Monthly cloud hosting')"),
           currency: z
             .string()
-            .length(3)
+            .regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP")
             .default("GBP")
             .describe("ISO 4217 currency code (default GBP)"),
           vatAmount: z
             .string()
+            .regex(
+              /^\d+(\.\d{1,2})?$/,
+              "Positive amount with at most 2 decimal places, e.g. '3.80'"
+            )
             .optional()
             .describe("VAT amount as string (e.g. '3.80')"),
           categoryUrl: z
@@ -197,7 +195,11 @@ export function registerExpenseTools(server: McpServer): void {
               "(same amount, date ±4 days) and link the expense to it."
             ),
         })
-        .strict(),
+        .strict()
+        .refine(
+          (a) => Boolean(a.fileBase64) === Boolean(a.fileName),
+          "Supply both fileBase64 and fileName, or neither — a lone value would be silently dropped."
+        ),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,

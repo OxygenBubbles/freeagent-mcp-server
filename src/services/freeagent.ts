@@ -11,7 +11,13 @@ import {
   FA_TOKEN_URL,
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
+  DEFAULT_LIST_LIMIT,
 } from "../constants.js";
+import {
+  toMinorUnits,
+  fromMinorUnits,
+  responseMoneyToMinor,
+} from "../utils/money.js";
 import type {
   FreeAgentToken,
   BankAccount,
@@ -165,6 +171,62 @@ function logResponseError(label: string, err: unknown): void {
   }
 }
 
+// ── Pagination ────────────────────────────────────────────────────────────────
+
+/** FreeAgent rejects per_page above this with "Records limited to 100 per page". */
+const API_MAX_PER_PAGE = 100;
+
+/** Safety stop so a runaway loop cannot page forever. 100 pages = 10,000 records. */
+const MAX_PAGES = 100;
+
+export interface PagedResult<T> {
+  items: T[];
+  /**
+   * True when the caller's limit (or the page ceiling) was reached with a full
+   * final page, so FreeAgent may hold more records than were returned. Callers
+   * that report totals MUST surface this — a silently truncated total is a
+   * wrong number, not a slow one.
+   */
+  mayHaveMore: boolean;
+}
+
+/**
+ * Fetch up to `limit` records, following pages until the collection is
+ * exhausted. FreeAgent caps a page at 100, so any limit above that needs
+ * several requests; asking for 200 in one call just gets a 400.
+ */
+async function faGetPaged<T>(
+  path: string,
+  collectionKey: string,
+  params: Record<string, unknown>,
+  limit: number
+): Promise<PagedResult<T>> {
+  const items: T[] = [];
+  let page = 1;
+
+  for (;;) {
+    const remaining = limit - items.length;
+    // Stopped on the caller's budget rather than the end of the collection.
+    if (remaining <= 0) return { items, mayHaveMore: true };
+
+    const perPage = Math.min(API_MAX_PER_PAGE, remaining);
+    const data = await faGet<Record<string, unknown>>(path, {
+      ...params,
+      per_page: perPage,
+      page,
+    });
+    const batch = Array.isArray(data[collectionKey])
+      ? (data[collectionKey] as T[])
+      : [];
+    items.push(...batch);
+
+    // A short page means the collection is exhausted.
+    if (batch.length < perPage) return { items, mayHaveMore: false };
+    if (page >= MAX_PAGES) return { items, mayHaveMore: true };
+    page++;
+  }
+}
+
 function faPut<T>(path: string, body: unknown): Promise<T> {
   return faRequest("put", path, body);
 }
@@ -175,10 +237,16 @@ function faPost<T>(path: string, body: unknown): Promise<T> {
 
 async function faDelete(path: string): Promise<void> {
   const token = await getAccessToken();
-  await axios.delete(`${FA_API_BASE}${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-    timeout: 30_000,
-  });
+  debugLog(`DELETE ${path}`);
+  try {
+    await axios.delete(`${FA_API_BASE}${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      timeout: 30_000,
+    });
+  } catch (err) {
+    logResponseError(`DELETE ${path}`, err);
+    throw err;
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -208,6 +276,19 @@ export function toAbsoluteUrl(pathOrUrl: string): string {
 }
 
 /**
+ * Guard a caller-supplied record ID before it reaches a URL path. The MCP
+ * schemas already constrain these, but the service layer must not depend on
+ * its callers having done so.
+ */
+export function assertNumericId(id: string, label: string): string {
+  const trimmed = String(id ?? "").trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid ${label} ID "${id}". Expected digits only.`);
+  }
+  return trimmed;
+}
+
+/**
  * Build a resolver that normalises a reference to an absolute URL for one
  * FreeAgent collection, rejecting references to anything else. Guards against
  * both malformed input and passing (say) a project where a category is wanted.
@@ -230,8 +311,6 @@ export const resolveProjectUrl = makeUrlResolver("projects", "project");
 export const resolveContactUrl = makeUrlResolver("contacts", "contact");
 export const resolveTaskUrl = makeUrlResolver("tasks", "task");
 export const resolveUserUrl = makeUrlResolver("users", "user");
-export const resolveInvoiceUrl = makeUrlResolver("invoices", "invoice");
-export const resolveBillUrl = makeUrlResolver("bills", "bill");
 
 /**
  * Expense claims are recorded from the claimant's point of view: a negative
@@ -239,11 +318,12 @@ export const resolveBillUrl = makeUrlResolver("bills", "bill");
  * from them. The tools take a positive amount, so flip the sign here.
  */
 export function toExpenseClaimValue(grossValue: string): string {
-  const n = Number.parseFloat(grossValue);
-  if (!Number.isFinite(n)) {
-    throw new Error(`Invalid gross amount "${grossValue}". Expected a number like "22.80".`);
+  // Strict: "22.80xyz" must fail rather than quietly file -22.80.
+  const minor = toMinorUnits(grossValue, "gross amount");
+  if (minor === 0) {
+    throw new Error(`Invalid gross amount "${grossValue}". A claim cannot be zero.`);
   }
-  return n > 0 ? `-${Math.abs(n)}` : String(n);
+  return fromMinorUnits(-Math.abs(minor));
 }
 
 // ── Bank accounts ────────────────────────────────────────────────────────────
@@ -263,22 +343,40 @@ export async function listBankTransactions(opts: {
   limit?: number;
   page?: number;
 }): Promise<BankTransaction[]> {
-  const limit = Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
   const params: Record<string, unknown> = {
-    bank_account: `${FA_API_BASE}/bank_accounts/${opts.bankAccountId}`,
-    per_page: limit,
-    page: opts.page ?? 1,
+    bank_account: `${FA_API_BASE}/bank_accounts/${assertNumericId(
+      opts.bankAccountId,
+      "bank account"
+    )}`,
   };
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
   if (opts.fromDate) params["from_date"] = opts.fromDate;
   if (opts.toDate) params["to_date"] = opts.toDate;
 
-  const data = await faGet<{ bank_transactions: BankTransaction[] }>(
-    "/bank_transactions",
-    params
-  );
+  let batch: BankTransaction[];
+  if (opts.page !== undefined) {
+    // Explicit page: return just that page.
+    const data = await faGet<{ bank_transactions: BankTransaction[] }>(
+      "/bank_transactions",
+      {
+        ...params,
+        per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+        page: opts.page,
+      }
+    );
+    batch = data.bank_transactions ?? [];
+  } else {
+    // No page given: page through so a match beyond the first 100 is still found.
+    const paged = await faGetPaged<BankTransaction>(
+      "/bank_transactions",
+      "bank_transactions",
+      params,
+      opts.limit ?? DEFAULT_LIST_LIMIT
+    );
+    batch = paged.items;
+  }
 
-  return (data.bank_transactions ?? []).map((t) => ({
+  return batch.map((t) => ({
     ...t,
     id: extractId(t),
     bank_transaction_explanations: (t.bank_transaction_explanations ?? []).map((e) => ({
@@ -447,6 +545,15 @@ export async function fetchUrlAsBase64(
 // ── Categories ───────────────────────────────────────────────────────────────
 
 let cachedCategories: ExpenseCategory[] | null = null;
+let categoriesCachedAt = 0;
+
+/**
+ * How long the chart of accounts and the current user are cached.
+ *
+ * The server is long-lived (the desktop app keeps it running for days), so an
+ * indefinite cache hides a category added in FreeAgent until a restart.
+ */
+const REFERENCE_CACHE_TTL_MS = 15 * 60_000;
 
 /**
  * GET /v2/categories does not return a flat "categories" array — it returns
@@ -461,7 +568,9 @@ const CATEGORY_GROUP_KEYS = [
 ] as const;
 
 export async function listCategories(): Promise<ExpenseCategory[]> {
-  if (cachedCategories) return cachedCategories;
+  if (cachedCategories && Date.now() - categoriesCachedAt < REFERENCE_CACHE_TTL_MS) {
+    return cachedCategories;
+  }
   const data = await faGet<Record<string, unknown>>("/categories");
 
   const flattened: ExpenseCategory[] = [];
@@ -479,45 +588,76 @@ export async function listCategories(): Promise<ExpenseCategory[]> {
   }
 
   cachedCategories = flattened;
+  categoriesCachedAt = Date.now();
   return cachedCategories;
 }
 
 /** Exported for tests — clears the module-level category cache. */
 export function _resetCategoryCache(): void {
   cachedCategories = null;
+  categoriesCachedAt = 0;
 }
 
 // ── Users ────────────────────────────────────────────────────────────────────
 
 let cachedUserUrl: string | null = null;
+let cachedUserAt = 0;
+let cachedUserKey = "";
+
+/** Identifies the credentials a cached value belongs to, without storing them. */
+function credentialFingerprint(): string {
+  const token = process.env.FREEAGENT_REFRESH_TOKEN ?? "";
+  const id = process.env.FREEAGENT_CLIENT_ID ?? "";
+  // Length + last 4 chars is enough to notice a change; the secret is not kept.
+  return `${id.length}:${token.length}:${token.slice(-4)}`;
+}
 
 /**
  * The URL of the authenticated user. FreeAgent requires `user` on every
  * expense — omitting it is rejected with "user can't be blank".
  */
 export async function getCurrentUserUrl(): Promise<string> {
-  if (cachedUserUrl) return cachedUserUrl;
+  const key = credentialFingerprint();
+  if (
+    cachedUserUrl &&
+    cachedUserKey === key &&
+    Date.now() - cachedUserAt < REFERENCE_CACHE_TTL_MS
+  ) {
+    return cachedUserUrl;
+  }
   const data = await faGet<{ user?: { url?: string } }>("/users/me");
   const url = data.user?.url;
   if (!url) {
     throw new Error("FreeAgent did not return a user URL from /users/me.");
   }
   cachedUserUrl = url;
+  cachedUserAt = Date.now();
+  cachedUserKey = key;
   return url;
 }
 
 /** Exported for tests — clears the module-level user cache. */
 export function _resetUserCache(): void {
   cachedUserUrl = null;
+  cachedUserAt = 0;
+  cachedUserKey = "";
 }
 
 // ── Projects ─────────────────────────────────────────────────────────────────
 
-export async function listProjects(view?: "active" | "completed" | "cancelled" | "all"): Promise<Project[]> {
+export async function listProjects(
+  view?: "active" | "completed" | "cancelled" | "all",
+  limit = DEFAULT_LIST_LIMIT
+): Promise<PagedResult<Project>> {
   const params: Record<string, unknown> = {};
   if (view && view !== "all") params["view"] = view;
-  const data = await faGet<{ projects: Project[] }>("/projects", params);
-  return (data.projects ?? []).map((p) => ({ ...p, id: extractId(p) }));
+  const { items, mayHaveMore } = await faGetPaged<Project>(
+    "/projects",
+    "projects",
+    params,
+    limit
+  );
+  return { items: items.map((p) => ({ ...p, id: extractId(p) })), mayHaveMore };
 }
 
 // ── Expenses ─────────────────────────────────────────────────────────────────
@@ -686,14 +826,16 @@ export async function listContacts(opts: {
   view?: "all" | "active" | "clients" | "suppliers" | "hidden";
   limit?: number;
   page?: number;
-} = {}): Promise<Contact[]> {
-  const params: Record<string, unknown> = {
-    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
-    page: opts.page ?? 1,
-  };
+} = {}): Promise<PagedResult<Contact>> {
+  const params: Record<string, unknown> = {};
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
-  const data = await faGet<{ contacts: Contact[] }>("/contacts", params);
-  return (data.contacts ?? []).map((c) => ({ ...c, id: extractId(c) }));
+  const { items, mayHaveMore } = await faGetPaged<Contact>(
+    "/contacts",
+    "contacts",
+    params,
+    opts.limit ?? DEFAULT_LIST_LIMIT
+  );
+  return { items: items.map((c) => ({ ...c, id: extractId(c) })), mayHaveMore };
 }
 
 export interface ContactInput {
@@ -767,23 +909,26 @@ export async function listInvoices(opts: {
   toDate?: string;
   limit?: number;
   page?: number;
-} = {}): Promise<Invoice[]> {
-  const params: Record<string, unknown> = {
-    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
-    page: opts.page ?? 1,
-  };
+} = {}): Promise<PagedResult<Invoice>> {
+  const params: Record<string, unknown> = {};
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
   if (opts.contactUrl) params["contact"] = resolveContactUrl(opts.contactUrl);
   if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
   if (opts.fromDate) params["from_date"] = opts.fromDate;
   if (opts.toDate) params["to_date"] = opts.toDate;
 
-  const data = await faGet<{ invoices: Invoice[] }>("/invoices", params);
-  return (data.invoices ?? []).map((i) => ({ ...i, id: extractId(i) }));
+  const { items, mayHaveMore } = await faGetPaged<Invoice>(
+    "/invoices",
+    "invoices",
+    params,
+    opts.limit ?? DEFAULT_LIST_LIMIT
+  );
+  return { items: items.map((i) => ({ ...i, id: extractId(i) })), mayHaveMore };
 }
 
 export async function getInvoice(invoiceId: string): Promise<Invoice> {
-  const data = await faGet<{ invoice: Invoice }>(`/invoices/${invoiceId}`);
+  const id = assertNumericId(invoiceId, "invoice");
+  const data = await faGet<{ invoice: Invoice }>(`/invoices/${id}`);
   return { ...data.invoice, id: extractId(data.invoice) };
 }
 
@@ -824,6 +969,8 @@ export function buildInvoiceBody(opts: InvoiceInput): { invoice: Record<string, 
     dated_on: opts.datedOn,
     payment_terms_in_days: opts.paymentTermsInDays,
     invoice_items: opts.items.map((item, index) => {
+      // Reject a malformed price outright — "750.00x" must not become 750.
+      toMinorUnits(item.price, `price on line ${index + 1}`);
       const line: Record<string, unknown> = {
         position: index + 1,
         description: item.description,
@@ -866,15 +1013,16 @@ export async function transitionInvoice(
   invoiceId: string,
   transition: InvoiceTransition
 ): Promise<Invoice> {
+  const id = assertNumericId(invoiceId, "invoice");
   const data = await faPut<{ invoice: Invoice }>(
-    `/invoices/${invoiceId}/transitions/${transition}`,
+    `/invoices/${id}/transitions/${transition}`,
     {}
   );
   return { ...data.invoice, id: extractId(data.invoice) };
 }
 
 export async function deleteInvoice(invoiceId: string): Promise<void> {
-  await faDelete(`/invoices/${invoiceId}`);
+  await faDelete(`/invoices/${assertNumericId(invoiceId, "invoice")}`);
 }
 
 // ── Bills ────────────────────────────────────────────────────────────────────
@@ -889,19 +1037,21 @@ export async function listBills(opts: {
   toDate?: string;
   limit?: number;
   page?: number;
-} = {}): Promise<Bill[]> {
-  const params: Record<string, unknown> = {
-    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
-    page: opts.page ?? 1,
-  };
+} = {}): Promise<PagedResult<Bill>> {
+  const params: Record<string, unknown> = {};
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
   if (opts.contactUrl) params["contact"] = resolveContactUrl(opts.contactUrl);
   if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
   if (opts.fromDate) params["from_date"] = opts.fromDate;
   if (opts.toDate) params["to_date"] = opts.toDate;
 
-  const data = await faGet<{ bills: Bill[] }>("/bills", params);
-  return (data.bills ?? []).map((b) => ({ ...b, id: extractId(b) }));
+  const { items, mayHaveMore } = await faGetPaged<Bill>(
+    "/bills",
+    "bills",
+    params,
+    opts.limit ?? DEFAULT_LIST_LIMIT
+  );
+  return { items: items.map((b) => ({ ...b, id: extractId(b) })), mayHaveMore };
 }
 
 export interface BillItemInput {
@@ -938,6 +1088,14 @@ export function buildBillBody(opts: BillInput): { bill: Record<string, unknown> 
     dated_on: opts.datedOn,
     due_on: opts.dueOn,
     bill_items: opts.items.map((item) => {
+      // A supplier bill is money owed, so each line must be positive. A credit
+      // from a supplier is a different document, not a negative bill line.
+      const minor = toMinorUnits(item.totalValue, "bill line value");
+      if (minor <= 0) {
+        throw new Error(
+          `Invalid bill line value "${item.totalValue}". A bill line must be greater than zero.`
+        );
+      }
       const line: Record<string, unknown> = {
         category: resolveCategoryUrl(item.categoryUrl),
         total_value: item.totalValue,
@@ -970,7 +1128,7 @@ export async function createBill(opts: BillInput): Promise<Bill> {
 }
 
 export async function deleteBill(billId: string): Promise<void> {
-  await faDelete(`/bills/${billId}`);
+  await faDelete(`/bills/${assertNumericId(billId, "bill")}`);
 }
 
 // ── Project tasks ────────────────────────────────────────────────────────────
@@ -979,14 +1137,17 @@ export async function listTasks(opts: {
   projectUrl?: string;
   view?: "all" | "active" | "completed" | "hidden";
   limit?: number;
-} = {}): Promise<Task[]> {
-  const params: Record<string, unknown> = {
-    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
-  };
+} = {}): Promise<PagedResult<Task>> {
+  const params: Record<string, unknown> = {};
   if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
-  const data = await faGet<{ tasks: Task[] }>("/tasks", params);
-  return (data.tasks ?? []).map((t) => ({ ...t, id: extractId(t) }));
+  const { items, mayHaveMore } = await faGetPaged<Task>(
+    "/tasks",
+    "tasks",
+    params,
+    opts.limit ?? DEFAULT_LIST_LIMIT
+  );
+  return { items: items.map((t) => ({ ...t, id: extractId(t) })), mayHaveMore };
 }
 
 export interface TaskInput {
@@ -1027,19 +1188,23 @@ export async function listTimeslips(opts: {
   projectUrl?: string;
   taskUrl?: string;
   limit?: number;
-}): Promise<Timeslip[]> {
+}): Promise<PagedResult<Timeslip>> {
   const params: Record<string, unknown> = {
     from_date: opts.fromDate,
     to_date: opts.toDate,
-    per_page: Math.min(opts.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
   };
   if (opts.view && opts.view !== "all") params["view"] = opts.view;
   if (opts.userUrl) params["user"] = resolveUserUrl(opts.userUrl);
   if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
   if (opts.taskUrl) params["task"] = resolveTaskUrl(opts.taskUrl);
 
-  const data = await faGet<{ timeslips: Timeslip[] }>("/timeslips", params);
-  return (data.timeslips ?? []).map((t) => ({ ...t, id: extractId(t) }));
+  const { items, mayHaveMore } = await faGetPaged<Timeslip>(
+    "/timeslips",
+    "timeslips",
+    params,
+    opts.limit ?? DEFAULT_LIST_LIMIT
+  );
+  return { items: items.map((t) => ({ ...t, id: extractId(t) })), mayHaveMore };
 }
 
 export function buildTimeslipBody(opts: {
@@ -1050,8 +1215,7 @@ export function buildTimeslipBody(opts: {
   hours: string;
   comment?: string;
 }): { timeslip: Record<string, unknown> } {
-  const hours = Number.parseFloat(opts.hours);
-  if (!Number.isFinite(hours) || hours <= 0) {
+  if (!/^\d+(\.\d+)?$/.test(String(opts.hours).trim()) || Number(opts.hours) <= 0) {
     throw new Error(`Invalid hours "${opts.hours}". Expected a positive number like "1.5".`);
   }
   const timeslip: Record<string, unknown> = {
@@ -1086,7 +1250,7 @@ export async function createTimeslip(opts: {
 }
 
 export async function deleteTimeslip(timeslipId: string): Promise<void> {
-  await faDelete(`/timeslips/${timeslipId}`);
+  await faDelete(`/timeslips/${assertNumericId(timeslipId, "timeslip")}`);
 }
 
 // ── Reports ──────────────────────────────────────────────────────────────────
@@ -1129,29 +1293,83 @@ export async function getTaxTimeline(): Promise<TaxTimelineItem[]> {
   return data.timeline_items ?? [];
 }
 
-/**
- * Standard 30/60/90 ageing buckets, computed from the open invoices or bills.
- * FreeAgent has no aged-debtors endpoint, so this derives them.
- */
-export function buildAgeingBuckets(
-  entries: Array<{ dueOn?: string; dueValue: string; label: string; reference?: string }>,
-  today: string
-): {
+const AGEING_BUCKETS = [
+  "not_yet_due",
+  "1_30_days",
+  "31_60_days",
+  "61_90_days",
+  "over_90_days",
+  // A record FreeAgent returned with no usable due date. Kept separate so it
+  // cannot masquerade as "not yet due" and quietly understate what is overdue.
+  "unknown_due_date",
+] as const;
+
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Parse a YYYY-MM-DD date to UTC ms, or null if it is absent/unusable. */
+function parseDateOnly(value: string | undefined): number | null {
+  if (!value || !DATE_ONLY_RE.test(value)) return null;
+  const ms = Date.parse(`${value}T00:00:00Z`);
+  if (!Number.isFinite(ms)) return null;
+  // Date.parse accepts "2026-02-31" and rolls it over; reject that.
+  const iso = new Date(ms).toISOString().slice(0, 10);
+  return iso === value ? ms : null;
+}
+
+export interface AgeingEntry {
+  label: string;
+  dueValue: string;
+  dueOn?: string;
+  reference?: string;
+}
+
+export interface AgeingReport {
   buckets: Record<string, { count: number; total: string }>;
   total: string;
-  items: Array<{ label: string; reference?: string; dueOn?: string; dueValue: string; daysOverdue: number; bucket: string }>;
-} {
-  const bucketNames = ["not_yet_due", "1_30_days", "31_60_days", "61_90_days", "over_90_days"];
-  const buckets: Record<string, { count: number; total: number }> = {};
-  for (const name of bucketNames) buckets[name] = { count: 0, total: 0 };
+  items: Array<AgeingEntry & { daysOverdue: number | null; bucket: string }>;
+  /** Records FreeAgent returned without a usable due date. */
+  unknownDueDateCount: number;
+}
 
-  const todayMs = Date.parse(`${today}T00:00:00Z`);
+/**
+ * Standard 30/60/90 ageing buckets, derived from open invoices or bills —
+ * FreeAgent has no aged-debtors endpoint.
+ *
+ * Money is summed in integer pence, and a malformed value throws rather than
+ * being coerced to zero: an ageing report that quietly drops a £12,000 invoice
+ * because the API changed a field is worse than one that fails loudly.
+ */
+export function buildAgeingBuckets(
+  entries: AgeingEntry[],
+  today: string
+): AgeingReport {
+  const todayMs = parseDateOnly(today);
+  if (todayMs === null) {
+    throw new Error(`Invalid reporting date "${today}". Expected YYYY-MM-DD.`);
+  }
+
+  const buckets: Record<string, { count: number; totalMinor: number }> = {};
+  for (const name of AGEING_BUCKETS) buckets[name] = { count: 0, totalMinor: 0 };
+
+  let totalMinor = 0;
+  let unknownDueDateCount = 0;
+
   const items = entries.map((entry) => {
-    const value = Number.parseFloat(entry.dueValue) || 0;
-    const dueMs = entry.dueOn ? Date.parse(`${entry.dueOn}T00:00:00Z`) : NaN;
-    const daysOverdue = Number.isFinite(dueMs)
-      ? Math.floor((todayMs - dueMs) / 86_400_000)
-      : 0;
+    const minor = responseMoneyToMinor(
+      entry.dueValue,
+      `outstanding value for "${entry.reference ?? entry.label}"`
+    );
+    totalMinor += minor;
+
+    const dueMs = parseDateOnly(entry.dueOn);
+    if (dueMs === null) {
+      unknownDueDateCount++;
+      buckets["unknown_due_date"]!.count += 1;
+      buckets["unknown_due_date"]!.totalMinor += minor;
+      return { ...entry, daysOverdue: null, bucket: "unknown_due_date" };
+    }
+
+    const daysOverdue = Math.floor((todayMs - dueMs) / 86_400_000);
     const bucket =
       daysOverdue <= 0 ? "not_yet_due"
       : daysOverdue <= 30 ? "1_30_days"
@@ -1159,16 +1377,21 @@ export function buildAgeingBuckets(
       : daysOverdue <= 90 ? "61_90_days"
       : "over_90_days";
     buckets[bucket]!.count += 1;
-    buckets[bucket]!.total += value;
+    buckets[bucket]!.totalMinor += minor;
     return { ...entry, daysOverdue: Math.max(0, daysOverdue), bucket };
   });
 
-  const total = items.reduce((sum, i) => sum + (Number.parseFloat(i.dueValue) || 0), 0);
-  const rounded: Record<string, { count: number; total: string }> = {};
+  const formatted: Record<string, { count: number; total: string }> = {};
   for (const [name, b] of Object.entries(buckets)) {
-    rounded[name] = { count: b.count, total: b.total.toFixed(2) };
+    formatted[name] = { count: b.count, total: fromMinorUnits(b.totalMinor) };
   }
-  return { buckets: rounded, total: total.toFixed(2), items };
+
+  return {
+    buckets: formatted,
+    total: fromMinorUnits(totalMinor),
+    items,
+    unknownDueDateCount,
+  };
 }
 
 // ── Error helper ──────────────────────────────────────────────────────────────

@@ -1,15 +1,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { listBills, createBill, deleteBill } from "../services/freeagent.js";
+import { sumResponseMoney } from "../utils/money.js";
 import { inferContentType } from "../utils/contentType.js";
-import { ok, fail, resourceRegex } from "./respond.js";
+import { ok, fail, resourceRegex, dateSchema } from "./respond.js";
 
 const CONTACT_REF = resourceRegex("contacts");
 const PROJECT_REF = resourceRegex("projects");
 const CATEGORY_REF = resourceRegex("categories");
 
-// Max ~7.5 MB binary when decoded; FreeAgent caps bill attachments at 5 MB.
-const FILE_BASE64_MAX = 7_000_000;
+// FreeAgent caps bill attachments at 5 MB. Base64 inflates by 4/3, so 5 MB of
+// file is ~6.99M characters; this bound keeps the decoded payload under the cap.
+const FILE_BASE64_MAX = 6_990_000;
 
 export function registerBillTools(server: McpServer): void {
   // ── List ────────────────────────────────────────────────────────────────
@@ -36,10 +38,8 @@ export function registerBillTools(server: McpServer): void {
             .regex(PROJECT_REF, "Must be a project path like /v2/projects/123")
             .optional()
             .describe("Only bills allocated to this project"),
-          fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
-            .describe("Earliest bill date YYYY-MM-DD"),
-          toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
-            .describe("Latest bill date YYYY-MM-DD"),
+          fromDate: dateSchema("Earliest bill date YYYY-MM-DD").optional(),
+          toDate: dateSchema("Latest bill date YYYY-MM-DD").optional(),
           limit: z.number().int().positive().max(100).default(50)
             .describe("Maximum bills to return (default 50, max 100)"),
         })
@@ -48,7 +48,7 @@ export function registerBillTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const bills = await listBills({
+        const { items, mayHaveMore } = await listBills({
           view: args.view,
           contactUrl: args.contact,
           projectUrl: args.project,
@@ -56,7 +56,7 @@ export function registerBillTools(server: McpServer): void {
           toDate: args.toDate,
           limit: args.limit,
         });
-        const rows = bills.map((b) => ({
+        const rows = items.map((b) => ({
           url: b.url,
           id: b.id,
           reference: b.reference ?? null,
@@ -69,14 +69,18 @@ export function registerBillTools(server: McpServer): void {
           total_value: b.total_value,
           due_value: b.due_value ?? null,
         }));
-        const outstanding = rows.reduce(
-          (sum, r) => sum + (parseFloat(r.due_value ?? "0") || 0),
-          0
+        const outstanding = sumResponseMoney(
+          rows.map((r) => r.due_value),
+          "bill due value"
         );
         return ok({
           bills: rows,
           count: rows.length,
-          totalOutstanding: outstanding.toFixed(2),
+          totalOutstandingForReturned: outstanding,
+          mayHaveMore,
+          ...(mayHaveMore
+            ? { warning: `More bills exist beyond the ${args.limit} fetched — the total above is partial. Use freeagent_aged_creditors for a complete figure.` }
+            : {}),
         });
       } catch (err) {
         return fail(err);
@@ -105,14 +109,8 @@ export function registerBillTools(server: McpServer): void {
             .min(1)
             .max(100)
             .describe("Supplier's invoice reference (e.g. 'INV-2049')"),
-          datedOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Bill date YYYY-MM-DD"),
-          dueOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Payment due date YYYY-MM-DD"),
+          datedOn: dateSchema("Bill date YYYY-MM-DD"),
+          dueOn: dateSchema("Payment due date YYYY-MM-DD"),
           items: z
             .array(
               z.object({
@@ -122,16 +120,27 @@ export function registerBillTools(server: McpServer): void {
                   .describe("Spending category for this line"),
                 totalValue: z
                   .string()
-                  .regex(/^-?\d+(\.\d+)?$/, "Numeric string, e.g. '120.00'")
-                  .describe("Line value INCLUDING tax (e.g. '120.00')"),
+                  .regex(
+                    /^\d+(\.\d{1,2})?$/,
+                    "Positive amount with at most 2 decimal places, e.g. '120.00'"
+                  )
+                  .describe(
+                    "Line value INCLUDING tax (e.g. '120.00'). Must be positive — " +
+                    "a supplier credit is a credit note, not a negative bill line."
+                  ),
                 description: z.string().max(500).optional().describe("Line description"),
-                salesTaxRate: z.string().optional().describe("VAT rate (e.g. '20.0')"),
+                salesTaxRate: z
+                  .string()
+                  .regex(/^\d+(\.\d+)?$/, "Percentage, e.g. '20.0'")
+                  .refine((v) => Number(v) <= 100, "VAT rate cannot exceed 100%")
+                  .optional()
+                  .describe("VAT rate (e.g. '20.0')"),
               })
             )
             .min(1)
             .max(40)
             .describe("Bill line items — at least one, at most 40"),
-          currency: z.string().length(3).optional().describe("ISO 4217 currency (default: company currency)"),
+          currency: z.string().regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP").optional().describe("ISO 4217 currency (default: company currency)"),
           project: z
             .string()
             .regex(PROJECT_REF, "Must be a project path like /v2/projects/123")
@@ -143,6 +152,7 @@ export function registerBillTools(server: McpServer): void {
             .describe("How to rebill this to the client"),
           rebillFactor: z
             .string()
+            .regex(/^\d+(\.\d+)?$/, "Numeric string, e.g. '15.0'")
             .optional()
             .describe("Markup percentage or fixed price — required for markup/price"),
           fileBase64: z
@@ -156,7 +166,11 @@ export function registerBillTools(server: McpServer): void {
             .optional()
             .describe("MIME type. Inferred from fileName if omitted."),
         })
-        .strict(),
+        .strict()
+        .refine(
+          (a) => Boolean(a.fileBase64) === Boolean(a.fileName),
+          "Supply both fileBase64 and fileName, or neither — a lone value would be silently dropped."
+        ),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,

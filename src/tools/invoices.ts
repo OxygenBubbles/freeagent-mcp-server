@@ -7,7 +7,8 @@ import {
   transitionInvoice,
   deleteInvoice,
 } from "../services/freeagent.js";
-import { ok, fail, resourceRegex } from "./respond.js";
+import { sumResponseMoney } from "../utils/money.js";
+import { ok, fail, resourceRegex, dateSchema } from "./respond.js";
 
 const CONTACT_REF = resourceRegex("contacts");
 const PROJECT_REF = resourceRegex("projects");
@@ -49,16 +50,8 @@ export function registerInvoiceTools(server: McpServer): void {
             .regex(PROJECT_REF, "Must be a project path like /v2/projects/123")
             .optional()
             .describe("Only invoices for this project"),
-          fromDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .optional()
-            .describe("Earliest invoice date YYYY-MM-DD"),
-          toDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .optional()
-            .describe("Latest invoice date YYYY-MM-DD"),
+          fromDate: dateSchema("Earliest invoice date YYYY-MM-DD").optional(),
+          toDate: dateSchema("Latest invoice date YYYY-MM-DD").optional(),
           limit: z.number().int().positive().max(100).default(50)
             .describe("Maximum invoices to return (default 50, max 100)"),
         })
@@ -67,7 +60,7 @@ export function registerInvoiceTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const invoices = await listInvoices({
+        const { items, mayHaveMore } = await listInvoices({
           view: args.view,
           contactUrl: args.contact,
           projectUrl: args.project,
@@ -75,7 +68,7 @@ export function registerInvoiceTools(server: McpServer): void {
           toDate: args.toDate,
           limit: args.limit,
         });
-        const rows = invoices.map((i) => ({
+        const rows = items.map((i) => ({
           url: i.url,
           id: i.id,
           reference: i.reference ?? null,
@@ -89,14 +82,20 @@ export function registerInvoiceTools(server: McpServer): void {
           paid_value: i.paid_value ?? null,
           due_value: i.due_value ?? null,
         }));
-        const outstanding = rows.reduce(
-          (sum, r) => sum + (parseFloat(r.due_value ?? "0") || 0),
-          0
+        const outstanding = sumResponseMoney(
+          rows.map((r) => r.due_value),
+          "invoice due value"
         );
         return ok({
           invoices: rows,
           count: rows.length,
-          totalOutstanding: outstanding.toFixed(2),
+          // Named to make the scope explicit: this totals what was returned,
+          // which is the whole set only when mayHaveMore is false.
+          totalOutstandingForReturned: outstanding,
+          mayHaveMore,
+          ...(mayHaveMore
+            ? { warning: `More invoices exist beyond the ${args.limit} fetched — the total above is partial. Use freeagent_aged_debtors for a complete figure.` }
+            : {}),
         });
       } catch (err) {
         return fail(err);
@@ -175,10 +174,7 @@ export function registerInvoiceTools(server: McpServer): void {
             .string()
             .regex(CONTACT_REF, "Must be a contact path like /v2/contacts/123")
             .describe("Contact to invoice"),
-          datedOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Invoice date YYYY-MM-DD"),
+          datedOn: dateSchema("Invoice date YYYY-MM-DD"),
           paymentTermsInDays: z
             .number()
             .int()
@@ -196,7 +192,10 @@ export function registerInvoiceTools(server: McpServer): void {
                   .describe("Line type (default Services)"),
                 price: z
                   .string()
-                  .regex(/^-?\d+(\.\d+)?$/, "Numeric string, e.g. '750.00'")
+                  .regex(
+                    /^-?\d+(\.\d{1,2})?$/,
+                    "Amount with at most 2 decimal places, e.g. '750.00'"
+                  )
                   .describe("Unit price as a string (e.g. '750.00')"),
                 quantity: z
                   .string()
@@ -205,6 +204,8 @@ export function registerInvoiceTools(server: McpServer): void {
                   .describe("Quantity (e.g. '1.0', or hours/days for time-based types)"),
                 salesTaxRate: z
                   .string()
+                  .regex(/^\d+(\.\d+)?$/, "Percentage, e.g. '20.0'")
+                  .refine((v) => Number(v) <= 100, "VAT rate cannot exceed 100%")
                   .optional()
                   .describe("VAT rate as a string (e.g. '20.0')"),
                 categoryUrl: z
@@ -222,7 +223,7 @@ export function registerInvoiceTools(server: McpServer): void {
             .max(100)
             .optional()
             .describe("Invoice reference/number. FreeAgent auto-numbers if omitted."),
-          currency: z.string().length(3).optional().describe("ISO 4217 currency (default: company currency)"),
+          currency: z.string().regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP").optional().describe("ISO 4217 currency (default: company currency)"),
           project: z
             .string()
             .regex(PROJECT_REF, "Must be a project path like /v2/projects/123")
@@ -230,7 +231,12 @@ export function registerInvoiceTools(server: McpServer): void {
             .describe("Project this invoice belongs to"),
           poReference: z.string().max(100).optional().describe("Client purchase order reference"),
           comments: z.string().max(2000).optional().describe("Notes shown on the invoice"),
-          discountPercent: z.string().optional().describe("Discount percentage (e.g. '10.0')"),
+          discountPercent: z
+            .string()
+            .regex(/^\d+(\.\d+)?$/, "Percentage, e.g. '10.0'")
+            .refine((v) => Number(v) <= 100, "Discount cannot exceed 100%")
+            .optional()
+            .describe("Discount percentage (e.g. '10.0')"),
         })
         .strict(),
       annotations: {
@@ -294,7 +300,10 @@ export function registerInvoiceTools(server: McpServer): void {
         .strict(),
       annotations: {
         readOnlyHint: false,
-        destructiveHint: false,
+        // mark_as_cancelled voids an issued invoice, which materially changes
+        // the accounting record. The tool is annotated for its most damaging
+        // transition so clients prompt before any of them.
+        destructiveHint: true,
         idempotentHint: true,
       },
     },

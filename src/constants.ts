@@ -4,9 +4,18 @@ export const FA_TOKEN_URL = "https://api.freeagent.com/v2/token_endpoint";
 
 // Response limits.
 // FreeAgent rejects per_page above 100 with "Records limited to 100 per page",
-// so this is a hard API ceiling, not a preference.
+// so this is a hard API ceiling, not a preference. Requests for more than a
+// page are satisfied by paging, never by asking for a bigger page.
 export const DEFAULT_PAGE_SIZE = 50;
 export const MAX_PAGE_SIZE = 100;
+
+// How many records a list tool returns when the caller does not say.
+export const DEFAULT_LIST_LIMIT = 100;
+
+// Reports must cover the whole ledger, not one page — a truncated aged-debtors
+// total is a wrong number. This bounds an unbounded fetch without realistically
+// clipping a small company's books.
+export const REPORT_MAX_RECORDS = 2000;
 
 // Bank transaction matching (expense → bank entry)
 export const DATE_TOLERANCE_DAYS = 4;

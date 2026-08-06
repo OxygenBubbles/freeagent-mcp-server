@@ -277,9 +277,45 @@ describe("buildAgeingBuckets", () => {
     expect(items[0]!.daysOverdue).toBe(0);
   });
 
-  it("handles an entry with no due date", () => {
-    const { buckets } = buildAgeingBuckets([{ label: "A", dueValue: "10.00" }], today);
-    expect(buckets["not_yet_due"]!.count).toBe(1);
+  it("does not let a missing due date masquerade as 'not yet due'", () => {
+    const { buckets, items, unknownDueDateCount } = buildAgeingBuckets(
+      [{ label: "A", dueValue: "10.00" }],
+      today
+    );
+    expect(buckets["not_yet_due"]!.count).toBe(0);
+    expect(buckets["unknown_due_date"]).toEqual({ count: 1, total: "10.00" });
+    expect(items[0]!.daysOverdue).toBeNull();
+    expect(unknownDueDateCount).toBe(1);
+  });
+
+  it("rejects a malformed outstanding value rather than counting it as zero", () => {
+    expect(() =>
+      buildAgeingBuckets([{ label: "A", dueOn: "2026-08-01", dueValue: "120.00oops" }], today)
+    ).toThrow(/not a number/);
+  });
+
+  it("treats an impossible due date as unknown, not as due today", () => {
+    const { buckets } = buildAgeingBuckets(
+      [{ label: "A", dueOn: "2026-02-31", dueValue: "10.00" }],
+      today
+    );
+    expect(buckets["unknown_due_date"]!.count).toBe(1);
+  });
+
+  it("rejects an invalid reporting date", () => {
+    expect(() => buildAgeingBuckets([], "not-a-date")).toThrow(/Invalid reporting date/);
+  });
+
+  it("sums exactly, without floating-point drift", () => {
+    // 0.1 + 0.2 !== 0.3 in binary floating point.
+    const { total } = buildAgeingBuckets(
+      [
+        { label: "A", dueOn: "2026-08-01", dueValue: "0.10" },
+        { label: "B", dueOn: "2026-08-01", dueValue: "0.20" },
+      ],
+      today
+    );
+    expect(total).toBe("0.30");
   });
 
   it("copes with an empty ledger", () => {

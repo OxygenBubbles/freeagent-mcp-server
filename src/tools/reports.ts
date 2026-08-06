@@ -9,13 +9,26 @@ import {
   listBills,
   buildAgeingBuckets,
 } from "../services/freeagent.js";
+import { REPORT_MAX_RECORDS } from "../constants.js";
+import { sumResponseMoney } from "../utils/money.js";
 import { ok, fail } from "./respond.js";
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
-/** Today in YYYY-MM-DD, for ageing calculations. */
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
+/**
+ * The date to age against.
+ *
+ * `new Date().toISOString()` is UTC, which is the wrong accounting day for
+ * anyone west of Greenwich in the evening (and can be a day early east of it).
+ * Ageing is computed in the host's local calendar day, and callers can pass an
+ * explicit `asAt` when they need a specific reporting date.
+ */
+function localToday(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
 }
 
 export function registerReportTools(server: McpServer): void {
@@ -80,12 +93,15 @@ export function registerReportTools(server: McpServer): void {
             total: e.total,
             category: e.category,
           }));
-        const sum = rows.reduce((s, r) => s + (parseFloat(r.total) || 0), 0);
+        const sum = sumResponseMoney(
+          rows.map((r) => r.total),
+          "trial balance total"
+        );
         return ok({
           accounts: rows,
           count: rows.length,
           // A balanced ledger sums to zero; a non-zero figure signals a problem.
-          sumOfBalances: sum.toFixed(2),
+          sumOfBalances: sum,
         });
       } catch (err) {
         return fail(err);
@@ -101,26 +117,45 @@ export function registerReportTools(server: McpServer): void {
       description:
         "Aged debtors — unpaid customer invoices bucketed by how overdue they are " +
         "(not yet due, 1-30, 31-60, 61-90, 90+ days). Shows who owes what and for how long.",
-      inputSchema: z.object({}).strict(),
+      inputSchema: z
+        .object({
+          asAt: z
+            .string()
+            .regex(DATE)
+            .optional()
+            .describe("Age against this date YYYY-MM-DD (default: today)"),
+        })
+        .strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async () => {
+    async (args) => {
       try {
-        const invoices = await listInvoices({ view: "open_or_overdue", limit: 200 });
+        // Reports must cover the whole ledger, so this pages to exhaustion
+        // rather than reading a single page.
+        const { items, mayHaveMore } = await listInvoices({
+          view: "open_or_overdue",
+          limit: REPORT_MAX_RECORDS,
+        });
         const aged = buildAgeingBuckets(
-          invoices.map((i) => ({
+          items.map((i) => ({
             label: i.contact_name ?? i.contact,
             reference: i.reference,
             dueOn: i.due_on,
             dueValue: i.due_value ?? "0",
           })),
-          today()
+          args.asAt ?? localToday()
         );
         return ok({
+          asAt: args.asAt ?? localToday(),
           totalOwedToUs: aged.total,
           buckets: aged.buckets,
           invoices: aged.items,
           count: aged.items.length,
+          unknownDueDateCount: aged.unknownDueDateCount,
+          complete: !mayHaveMore,
+          ...(mayHaveMore
+            ? { warning: `More than ${REPORT_MAX_RECORDS} open invoices exist; this total is incomplete.` }
+            : {}),
         });
       } catch (err) {
         return fail(err);
@@ -134,26 +169,43 @@ export function registerReportTools(server: McpServer): void {
       description:
         "Aged creditors — unpaid supplier bills bucketed by how overdue they are. " +
         "Shows what the company owes and for how long.",
-      inputSchema: z.object({}).strict(),
+      inputSchema: z
+        .object({
+          asAt: z
+            .string()
+            .regex(DATE)
+            .optional()
+            .describe("Age against this date YYYY-MM-DD (default: today)"),
+        })
+        .strict(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async () => {
+    async (args) => {
       try {
-        const bills = await listBills({ view: "open_or_overdue", limit: 200 });
+        const { items, mayHaveMore } = await listBills({
+          view: "open_or_overdue",
+          limit: REPORT_MAX_RECORDS,
+        });
         const aged = buildAgeingBuckets(
-          bills.map((b) => ({
+          items.map((b) => ({
             label: b.contact,
             reference: b.reference,
             dueOn: b.due_on,
             dueValue: b.due_value ?? "0",
           })),
-          today()
+          args.asAt ?? localToday()
         );
         return ok({
+          asAt: args.asAt ?? localToday(),
           totalWeOwe: aged.total,
           buckets: aged.buckets,
           bills: aged.items,
           count: aged.items.length,
+          unknownDueDateCount: aged.unknownDueDateCount,
+          complete: !mayHaveMore,
+          ...(mayHaveMore
+            ? { warning: `More than ${REPORT_MAX_RECORDS} open bills exist; this total is incomplete.` }
+            : {}),
         });
       } catch (err) {
         return fail(err);

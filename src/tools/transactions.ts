@@ -11,6 +11,7 @@ import {
   handleFAError,
 } from "../services/freeagent.js";
 import { inferContentType } from "../utils/contentType.js";
+import { dateSchema } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
@@ -40,16 +41,8 @@ export function registerTransactionTools(server: McpServer): void {
             .enum(["unexplained", "explained", "all", "marked_for_review", "manual", "imported"])
             .default("unexplained")
             .describe("Which transactions to return. Defaults to unexplained. Use 'marked_for_review' for auto-categorised transactions awaiting approval."),
-          fromDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .optional()
-            .describe("Start date filter YYYY-MM-DD (inclusive)"),
-          toDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .optional()
-            .describe("End date filter YYYY-MM-DD (inclusive)"),
+          fromDate: dateSchema("Start date filter YYYY-MM-DD (inclusive)").optional(),
+          toDate: dateSchema("End date filter YYYY-MM-DD (inclusive)").optional(),
           limit: z
             .number()
             .int()

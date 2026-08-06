@@ -45,9 +45,12 @@ export function registerContactTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const contacts = await listContacts({ view: args.view, limit: args.limit });
+        const { items, mayHaveMore } = await listContacts({
+          view: args.view,
+          limit: args.limit,
+        });
         const needle = args.search?.toLowerCase();
-        const rows = contacts
+        const rows = items
           .map((c) => ({
             url: c.url,
             id: c.id,
@@ -64,7 +67,17 @@ export function registerContactTools(server: McpServer): void {
               r.name.toLowerCase().includes(needle) ||
               (r.email ?? "").toLowerCase().includes(needle)
           );
-        return ok({ contacts: rows, count: rows.length });
+        return ok({
+          contacts: rows,
+          count: rows.length,
+          // A search that only looked at part of the ledger must say so —
+          // otherwise "no match" reads as "does not exist" and a duplicate
+          // contact gets created.
+          mayHaveMore,
+          ...(mayHaveMore
+            ? { warning: `More contacts exist beyond the ${args.limit} fetched. Raise limit or narrow the view.` }
+            : {}),
+        });
       } catch (err) {
         return fail(err);
       }

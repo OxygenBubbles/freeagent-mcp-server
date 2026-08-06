@@ -7,7 +7,8 @@ import {
   createTimeslip,
   deleteTimeslip,
 } from "../services/freeagent.js";
-import { ok, fail, resourceRegex } from "./respond.js";
+import { parseStrictDecimal } from "../utils/money.js";
+import { ok, fail, resourceRegex, dateSchema } from "./respond.js";
 
 const PROJECT_REF = resourceRegex("projects");
 const TASK_REF = resourceRegex("tasks");
@@ -41,7 +42,7 @@ export function registerTimeTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const tasks = await listTasks({
+        const { items: tasks, mayHaveMore } = await listTasks({
           projectUrl: args.project,
           view: args.view,
           limit: args.limit,
@@ -56,7 +57,7 @@ export function registerTimeTools(server: McpServer): void {
           billing_period: t.billing_period ?? null,
           status: t.status ?? null,
         }));
-        return ok({ tasks: rows, count: rows.length });
+        return ok({ tasks: rows, count: rows.length, mayHaveMore });
       } catch (err) {
         return fail(err);
       }
@@ -86,7 +87,7 @@ export function registerTimeTools(server: McpServer): void {
             .enum(["hour", "day"])
             .optional()
             .describe("Whether the billing rate is per hour or per day"),
-          currency: z.string().length(3).optional().describe("ISO 4217 currency code"),
+          currency: z.string().regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP").optional().describe("ISO 4217 currency code"),
           status: z
             .enum(["Active", "Completed", "Hidden"])
             .default("Active")
@@ -136,14 +137,8 @@ export function registerTimeTools(server: McpServer): void {
         "Returns per-project totals alongside the individual entries.",
       inputSchema: z
         .object({
-          fromDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Start of the date range YYYY-MM-DD"),
-          toDate: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("End of the date range YYYY-MM-DD"),
+          fromDate: dateSchema("Start of the date range YYYY-MM-DD"),
+          toDate: dateSchema("End of the date range YYYY-MM-DD"),
           view: z
             .enum(["all", "unbilled", "running"])
             .default("all")
@@ -171,7 +166,7 @@ export function registerTimeTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const timeslips = await listTimeslips({
+        const { items: timeslips, mayHaveMore } = await listTimeslips({
           fromDate: args.fromDate,
           toDate: args.toDate,
           view: args.view,
@@ -192,10 +187,16 @@ export function registerTimeTools(server: McpServer): void {
           billed_on_invoice: t.billed_on_invoice ?? null,
         }));
 
-        const totalHours = rows.reduce((sum, r) => sum + (parseFloat(r.hours) || 0), 0);
+        // Hours are strictly parsed so a malformed value fails rather than
+        // silently contributing zero to a billing total.
+        const totalHours = rows.reduce(
+          (sum, r) => sum + parseStrictDecimal(r.hours, "timeslip hours"),
+          0
+        );
         const byProject: Record<string, number> = {};
         for (const r of rows) {
-          byProject[r.project] = (byProject[r.project] ?? 0) + (parseFloat(r.hours) || 0);
+          byProject[r.project] =
+            (byProject[r.project] ?? 0) + parseStrictDecimal(r.hours, "timeslip hours");
         }
 
         return ok({
@@ -205,6 +206,10 @@ export function registerTimeTools(server: McpServer): void {
           hoursByProject: Object.fromEntries(
             Object.entries(byProject).map(([k, v]) => [k, v.toFixed(2)])
           ),
+          mayHaveMore,
+          ...(mayHaveMore
+            ? { warning: `More timeslips exist beyond the ${args.limit} fetched — the totals above are partial.` }
+            : {}),
         });
       } catch (err) {
         return fail(err);
@@ -229,10 +234,7 @@ export function registerTimeTools(server: McpServer): void {
             .string()
             .regex(TASK_REF, "Must be a task path like /v2/tasks/123")
             .describe("Task the time is logged against"),
-          datedOn: z
-            .string()
-            .regex(/^\d{4}-\d{2}-\d{2}$/)
-            .describe("Date the work was done YYYY-MM-DD"),
+          datedOn: dateSchema("Date the work was done YYYY-MM-DD"),
           hours: z
             .string()
             .regex(/^\d+(\.\d+)?$/, "Numeric string, e.g. '7.5'")

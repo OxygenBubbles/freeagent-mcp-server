@@ -167,7 +167,7 @@ describe("buildExpenseBody", () => {
       category: "https://api.freeagent.com/v2/categories/285",
       dated_on: "2011-08-24",
       description: "Some description",
-      gross_value: "-12",
+      gross_value: "-12.00",
       currency: "GBP",
       sales_tax_rate: "20.0",
       manual_sales_tax_amount: "0.12",
