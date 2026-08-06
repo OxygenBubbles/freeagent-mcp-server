@@ -18,6 +18,7 @@ import {
   fromMinorUnits,
   responseMoneyToMinor,
 } from "../utils/money.js";
+import { assertPublicUrl, isBlockedAddress } from "../utils/safeFetch.js";
 import type {
   FreeAgentToken,
   BankAccount,
@@ -47,10 +48,30 @@ function debugEnabled(): boolean {
   return v === "1" || v === "true";
 }
 
-/** Replace secrets and bulky base64 blobs before anything reaches the log. */
+/** Patterns that look like credentials wherever they appear in a string. */
+const SECRET_PATTERNS: RegExp[] = [
+  /\bBearer\s+[A-Za-z0-9._~+/-]{8,}=*/gi,
+  /\b(?:access|refresh|api|auth)[_-]?token["'\s:=]+[A-Za-z0-9._~+/-]{8,}/gi,
+  /\bclient[_-]?secret["'\s:=]+[A-Za-z0-9._~+/-]{8,}/gi,
+];
+
+function scrubSecrets(text: string): string {
+  let out = text;
+  for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, "<redacted>");
+  return out;
+}
+
+/**
+ * Replace secrets and bulky base64 blobs before anything reaches the log.
+ *
+ * Keys are matched first, but a token can also arrive inside a message body
+ * or under an unexpected key, so string values are scrubbed by pattern too.
+ */
 function redact(value: unknown): unknown {
   if (typeof value === "string") {
-    return value.length > 256 ? `<${value.length} chars omitted>` : value;
+    return value.length > 256
+      ? `<${value.length} chars omitted>`
+      : scrubSecrets(value);
   }
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === "object") {
@@ -65,6 +86,11 @@ function redact(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+/** Exported for tests — the redaction applied before anything is logged. */
+export function _redactForTests(value: unknown): unknown {
+  return redact(value);
 }
 
 function debugLog(label: string, payload?: unknown): void {
@@ -516,20 +542,52 @@ export async function deleteExistingAttachment(explanationId: string): Promise<b
   return true;
 }
 
+/** Attachments are capped well below FreeAgent's own limit. */
+export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+
 /**
  * Download a file from a URL and return it base64-encoded, so a receipt PDF
  * (e.g. a Stripe "Download invoice" link) can be attached without the caller
- * ever handling the raw bytes. Follows redirects.
+ * ever handling the raw bytes.
+ *
+ * The URL is untrusted input, so the host is checked before the request and
+ * again on every redirect: a public hostname can otherwise redirect to
+ * localhost or a cloud metadata endpoint. The response is also size-capped —
+ * an unbounded download is buffered twice (raw plus base64) and would be an
+ * easy way to exhaust memory.
  */
 export async function fetchUrlAsBase64(
   url: string
 ): Promise<{ base64: string; fileName?: string; contentType?: string }> {
+  await assertPublicUrl(url);
+
   const resp = await axios.get<ArrayBuffer>(url, {
     responseType: "arraybuffer",
     timeout: 60_000,
     maxRedirects: 5,
+    maxContentLength: MAX_DOWNLOAD_BYTES,
+    maxBodyLength: MAX_DOWNLOAD_BYTES,
     headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" },
+    // Re-check each hop: the first host being public says nothing about where
+    // it redirects to.
+    beforeRedirect: (options) => {
+      const target = `${options.protocol}//${options.hostname}${options.path ?? ""}`;
+      const host = String(options.hostname ?? "").replace(/^\[|\]$/g, "");
+      if (isBlockedAddress(host)) {
+        throw new Error(`Refusing to follow a redirect to a non-public address: ${target}`);
+      }
+    },
   });
+
+  const byteLength = (resp.data as ArrayBuffer).byteLength ?? 0;
+  if (byteLength > MAX_DOWNLOAD_BYTES) {
+    throw new Error(
+      `Downloaded file is ${Math.round(byteLength / 1_048_576)} MB, above the ${
+        MAX_DOWNLOAD_BYTES / 1_048_576
+      } MB limit.`
+    );
+  }
+
   const base64 = Buffer.from(resp.data).toString("base64");
   let fileName: string | undefined;
   const cd = resp.headers["content-disposition"];

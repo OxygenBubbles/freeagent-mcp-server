@@ -24,7 +24,11 @@ The FreeAgent OAuth credentials grant **full access** to the connected FreeAgent
 
 FreeAgent does not offer granular OAuth scopes — authorising an app grants access to all of the above.
 
-**Destructive operations.** The delete tools are flagged `destructiveHint: true` so your MCP client can prompt before running them. The server never deletes bank transactions or contacts, and never emails anything to your clients — `freeagent_update_invoice_status` changes an invoice's status only.
+**Destructive operations.** The delete tools are flagged `destructiveHint: true` so your MCP client can prompt before running them, as is `freeagent_update_invoice_status` (its `mark_as_cancelled` transition voids an issued invoice). The server never deletes bank transactions or contacts, and never emails anything to your clients — status transitions change status only.
+
+**Outbound fetches.** `freeagent_explain_transaction` accepts a `fileUrl` to download a receipt. That URL is treated as untrusted input: only `http`/`https` are allowed, hosts resolving to loopback, link-local, or private addresses are refused (on the initial request *and* on every redirect), and downloads are capped at 10 MB.
+
+**Truncation.** List tools page through results and report `mayHaveMore`; when true, any total they return covers only the records fetched and is named `totalOutstandingForReturned`. The `freeagent_aged_debtors` and `freeagent_aged_creditors` reports page to exhaustion and return `complete: true` — treat `complete: false` as an incomplete figure. Records whose due date is missing or unparseable are counted in a separate `unknown_due_date` bucket rather than being assumed not yet due.
 
 ### Email and file sources (external — not provided by this server)
 
