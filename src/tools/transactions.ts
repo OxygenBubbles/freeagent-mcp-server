@@ -11,7 +11,7 @@ import {
   handleFAError,
 } from "../services/freeagent.js";
 import { inferContentType } from "../utils/contentType.js";
-import { dateSchema } from "./respond.js";
+import { dateSchema, invalid } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
@@ -159,24 +159,27 @@ export function registerTransactionTools(server: McpServer): void {
             .optional()
             .describe("URL of a receipt to download and attach (e.g. a Stripe 'Download invoice' link). The server fetches and encodes it — no need to handle bytes."),
         })
-        .strict()
-        .refine(
-          (a) =>
-            [a.fileBase64, a.filePath, a.fileUrl].filter(Boolean).length <= 1,
-          "Supply at most one of fileBase64, filePath or fileUrl."
-        )
-        .refine(
-          (a) => !a.fileBase64 || Boolean(a.fileName),
-          "fileBase64 requires fileName."
-        ),
+        .strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: true,
       },
     },
+      // NOTE: these checks are NOT schema-level .refine(). Calling .refine()
+      // on the object turns it into a ZodEffects, which the MCP SDK cannot read
+      // a .shape from — it then advertises an EMPTY inputSchema, so clients see
+      // no parameters and send none. Cross-field rules belong in the handler.
     async (args) => {
       try {
+        const sources = [args.fileBase64, args.filePath, args.fileUrl].filter(Boolean);
+        if (sources.length > 1) {
+          return invalid("Supply at most one of fileBase64, filePath or fileUrl.");
+        }
+        if (args.fileBase64 && !args.fileName) {
+          return invalid("fileBase64 requires fileName.");
+        }
+
         const actions: string[] = [];
 
         // 1. Attach file if provided — resolve bytes from filePath / fileUrl / fileBase64.

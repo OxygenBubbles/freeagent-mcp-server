@@ -3,7 +3,7 @@ import { z } from "zod";
 import { listBills, createBill, deleteBill } from "../services/freeagent.js";
 import { sumResponseMoney } from "../utils/money.js";
 import { inferContentType } from "../utils/contentType.js";
-import { ok, fail, resourceRegex, dateSchema } from "./respond.js";
+import { ok, fail, invalid, resourceRegex, dateSchema } from "./respond.js";
 
 const CONTACT_REF = resourceRegex("contacts");
 const PROJECT_REF = resourceRegex("projects");
@@ -172,19 +172,25 @@ export function registerBillTools(server: McpServer): void {
             .optional()
             .describe("MIME type. Inferred from fileName if omitted."),
         })
-        .strict()
-        .refine(
-          (a) => Boolean(a.fileBase64) === Boolean(a.fileName),
-          "Supply both fileBase64 and fileName, or neither — a lone value would be silently dropped."
-        ),
+        .strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: false,
       },
     },
+      // NOTE: this check is NOT a schema-level .refine(). Calling .refine() on
+      // the object turns it into a ZodEffects, which the MCP SDK cannot read a
+      // .shape from — it then advertises an EMPTY inputSchema, so clients see
+      // no parameters and send none. Cross-field rules belong in the handler.
     async (args) => {
       try {
+        if (Boolean(args.fileBase64) !== Boolean(args.fileName)) {
+          return invalid(
+            "Supply both fileBase64 and fileName, or neither — a lone value would be silently dropped."
+          );
+        }
+
         const attachment =
           args.fileBase64 && args.fileName
             ? {

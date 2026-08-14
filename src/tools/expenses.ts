@@ -13,7 +13,7 @@ import { inferContentType } from "../utils/contentType.js";
 import { parseAmount, addDays } from "../utils/amount.js";
 import { findMatchingTransactions, decideLink } from "../utils/matchTransaction.js";
 import { lookupCategory } from "../utils/vendorCategories.js";
-import { dateSchema } from "./respond.js";
+import { dateSchema, invalid } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
@@ -196,19 +196,25 @@ export function registerExpenseTools(server: McpServer): void {
               "(same amount, date ±4 days) and link the expense to it."
             ),
         })
-        .strict()
-        .refine(
-          (a) => Boolean(a.fileBase64) === Boolean(a.fileName),
-          "Supply both fileBase64 and fileName, or neither — a lone value would be silently dropped."
-        ),
+        .strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: false,
       },
     },
+      // NOTE: this check is NOT a schema-level .refine(). Calling .refine() on
+      // the object turns it into a ZodEffects, which the MCP SDK cannot read a
+      // .shape from — it then advertises an EMPTY inputSchema, so clients see
+      // no parameters and send none. Cross-field rules belong in the handler.
     async (args) => {
       try {
+        if (Boolean(args.fileBase64) !== Boolean(args.fileName)) {
+          return invalid(
+            "Supply both fileBase64 and fileName, or neither — a lone value would be silently dropped."
+          );
+        }
+
         // Resolve category
         const categoryUrl = args.categoryUrl ?? lookupCategory(args.vendor);
         if (!categoryUrl) {

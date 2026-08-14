@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { listContacts, createContact } from "../services/freeagent.js";
-import { ok, fail } from "./respond.js";
+import { ok, fail, invalid } from "./respond.js";
 
 /** Human-readable name for a contact, which may be a person, an org, or both. */
 function displayName(c: {
@@ -119,19 +119,22 @@ export function registerContactTools(server: McpServer): void {
             .optional()
             .describe("Show the person's name rather than the organisation on invoices"),
         })
-        .strict()
-        .refine(
-          (a) => Boolean(a.organisationName || a.firstName || a.lastName),
-          "Supply organisationName, or firstName/lastName, or both."
-        ),
+        .strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: false,
       },
     },
+      // NOTE: this check is NOT a schema-level .refine(). Calling .refine() on
+      // the object turns it into a ZodEffects, which the MCP SDK cannot read a
+      // .shape from — it then advertises an EMPTY inputSchema, so clients see
+      // no parameters and send none. Cross-field rules belong in the handler.
     async (args) => {
       try {
+        if (!args.organisationName && !args.firstName && !args.lastName) {
+          return invalid("Supply organisationName, or firstName/lastName, or both.");
+        }
         const contact = await createContact(args);
         return ok({
           success: true,
