@@ -84,6 +84,12 @@ export function registerTransactionTools(server: McpServer): void {
             category: exp?.category ?? null,
             marked_for_review: exp?.marked_for_review ?? null,
             sales_tax_value: exp?.sales_tax_value ?? null,
+            // Without these a transaction that is tagged to a project but not
+            // set to rebill looks identical to one that is, so a client
+            // invoice silently comes out short.
+            project: exp?.project ?? null,
+            rebill_type: exp?.rebill_type ?? null,
+            rebill_factor: exp?.rebill_factor ?? null,
           };
         });
 
@@ -110,6 +116,8 @@ export function registerTransactionTools(server: McpServer): void {
         "Approve or update a FreeAgent bank transaction explanation. Use this to:\n" +
         "- Approve a 'marked for review' transaction (set markExplained=true)\n" +
         "- Change the category or description of an explanation\n" +
+        "- Tag it to a project and set how it rebills to the client (project + rebillType)\n" +
+        "- Correct its VAT treatment (ecStatus, vatRate)\n" +
         "- Attach a receipt/invoice — PREFER filePath (a local file) or fileUrl (a download link); the server reads/encodes it. Re-attaching replaces any existing attachment.\n" +
         "Get the explanationId from freeagent_list_transactions (explanation_id field).\n\n" +
         "RECEIPTS: Before asking the user for a file, search connected email tools (Gmail, Outlook/M365) " +
@@ -136,6 +144,40 @@ export function registerTransactionTools(server: McpServer): void {
             .boolean()
             .default(false)
             .describe("Set true to approve/reconcile the transaction. Only do this when evidence is attached or confirmed."),
+          project: z
+            .string()
+            .regex(
+              /^(?:https:\/\/api\.freeagent\.com)?\/v2\/projects\/\d+$|^$/,
+              "Must be a project path like /v2/projects/123, or '' to untag"
+            )
+            .optional()
+            .describe(
+              "FreeAgent project URL to tag this transaction against. Pass '' to remove the tag. " +
+              "Use freeagent_list_projects to find it."
+            ),
+          rebillType: z
+            .enum(["cost", "markup", "price", ""])
+            .optional()
+            .describe(
+              "How to rebill this cost to the client — 'cost' bills it on at cost, 'markup' adds a " +
+              "percentage, 'price' charges a fixed price. Requires a project. Pass '' to stop rebilling. " +
+              "Without it a project-tagged transaction is attributed but never billed on."
+            ),
+          rebillFactor: z
+            .string()
+            .regex(/^\d+(\.\d+)?$/, "Numeric string, e.g. '15.0'")
+            .optional()
+            .describe("Markup percentage or fixed price — required for markup/price"),
+          ecStatus: z
+            .enum(["UK/Non-EC", "EC Goods", "EC Services", "Reverse Charge"])
+            .optional()
+            .describe("VAT treatment for the purchase (defaults to 'UK/Non-EC')"),
+          vatRate: z
+            .string()
+            .regex(/^\d+(\.\d+)?$/, "Percentage, e.g. '20.0'")
+            .refine((v) => Number(v) <= 100, "VAT rate cannot exceed 100%")
+            .optional()
+            .describe("VAT rate as a percentage (e.g. '20.0')"),
           fileBase64: z
             .string()
             .max(FILE_BASE64_MAX, "File must be under ~7.5 MB (10 MB base64)")
@@ -175,6 +217,20 @@ export function registerTransactionTools(server: McpServer): void {
         const badSource = checkAttachmentSource(args);
         if (badSource) return invalid(badSource);
 
+        if (
+          (args.rebillType === "markup" || args.rebillType === "price") &&
+          !args.rebillFactor
+        ) {
+          return invalid(
+            `rebillType '${args.rebillType}' needs rebillFactor (the markup percentage or fixed price).`
+          );
+        }
+        if (args.rebillFactor && !args.rebillType) {
+          return invalid(
+            "rebillFactor does nothing without rebillType — say whether it is a markup or a fixed price."
+          );
+        }
+
         const actions: string[] = [];
 
         // 1. Attach file if provided — resolve bytes from filePath / fileUrl / fileBase64.
@@ -203,6 +259,11 @@ export function registerTransactionTools(server: McpServer): void {
         const needsUpdate =
           args.description !== undefined ||
           args.category !== undefined ||
+          args.project !== undefined ||
+          args.rebillType !== undefined ||
+          args.rebillFactor !== undefined ||
+          args.ecStatus !== undefined ||
+          args.vatRate !== undefined ||
           args.markExplained;
 
         let explanation;
@@ -212,9 +273,30 @@ export function registerTransactionTools(server: McpServer): void {
             description: args.description,
             category: args.category,
             markExplained: args.markExplained,
+            projectUrl: args.project,
+            rebillType: args.rebillType,
+            rebillFactor: args.rebillFactor,
+            ecStatus: args.ecStatus,
+            salesTaxRate: args.vatRate,
           });
           if (args.description) actions.push(`Description set to "${args.description}"`);
           if (args.category) actions.push(`Category set to ${args.category}`);
+          if (args.project !== undefined) {
+            actions.push(
+              args.project === ""
+                ? "Project tag removed"
+                : `Tagged to project ${args.project}`
+            );
+          }
+          if (args.rebillType !== undefined) {
+            actions.push(
+              args.rebillType === ""
+                ? "Rebilling turned off"
+                : `Rebill set to ${args.rebillType}${args.rebillFactor ? ` (${args.rebillFactor})` : ""}`
+            );
+          }
+          if (args.ecStatus) actions.push(`EC status set to ${args.ecStatus}`);
+          if (args.vatRate) actions.push(`VAT rate set to ${args.vatRate}%`);
           if (args.markExplained) actions.push("Approved (marked_for_review cleared)");
         }
 

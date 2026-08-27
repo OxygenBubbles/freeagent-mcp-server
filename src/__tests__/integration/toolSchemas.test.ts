@@ -37,8 +37,9 @@ const PARAMETERLESS = new Set([
 /** Parameters a caller cannot do without, by tool. */
 const REQUIRED_PARAMS: Record<string, string[]> = {
   freeagent_list_transactions: ["bankAccountId"],
-  freeagent_explain_transaction: ["explanationId", "category", "fileUrl", "markExplained"],
+  freeagent_explain_transaction: ["explanationId", "category", "fileUrl", "markExplained", "project", "rebillType", "rebillFactor"],
   freeagent_create_expense: ["vendor", "datedOn", "grossAmount", "description", "rebillType", "filePath", "ecStatus"],
+  freeagent_list_expenses: ["fromDate", "toDate", "project", "unbilledOnly", "untaggedRebillOnly"],
   freeagent_update_expense: ["expenseId", "rebillType", "filePath", "fileUrl"],
   freeagent_create_contact: ["organisationName", "firstName", "email", "salesTaxRegistrationNumber"],
   freeagent_create_invoice: ["contact", "datedOn", "items", "ecStatus", "placeOfSupply"],

@@ -5,7 +5,7 @@
  * Tools for FreeAgent bookkeeping:
  *  - List bank accounts and transactions
  *  - Explain transactions (categorise, describe, attach receipt, approve)
- *  - Create expenses from receipts (personal card / cash claims)
+ *  - List, create, amend and delete expenses (personal card / cash claims)
  *  - Create mileage expenses
  *  - List expense categories; create and manage projects
  *  - Manage contacts (clients and suppliers) and projects
@@ -73,7 +73,7 @@ if (process.argv[2] === "auth") {
 const server = new McpServer(
   {
     name: "freeagent-mcp-server",
-    version: "3.1.0",
+    version: "3.2.0",
   },
   {
     instructions: `
@@ -95,7 +95,9 @@ An expense, bill or explanation that was filed without a receipt can be fixed af
 
 ## Rebilling and VAT — two things that fail silently
 
-- Tagging an expense or bill to a **project** attributes the cost to it but does NOT queue it to bill on. Pass \`rebillType\` (\`cost\`, \`markup\` or \`price\`) as well whenever the user says a cost is being passed on to a client.
+- Tagging an expense, bill or bank transaction to a **project** attributes the cost to it but does NOT queue it to bill on. Pass \`rebillType\` (\`cost\`, \`markup\` or \`price\`) as well whenever the user says a cost is being passed on to a client.
+- To find costs that fell into that trap, call \`freeagent_list_expenses\` with \`untaggedRebillOnly: true\` — those are attributed to a client but will never reach an invoice. \`unbilledOnly: true\` lists what IS queued but not yet billed.
+- \`freeagent_list_transactions\` reports \`project\` and \`rebill_type\` per transaction; a bank transaction is corrected with \`freeagent_explain_transaction\`, which takes the same rebilling fields.
 - \`ecStatus\` defaults to \`UK/Non-EC\` on every expense, bill and invoice. For an overseas supplier or client, or anything under the reverse charge, set it explicitly — otherwise the item lands in the wrong box on the VAT return and nothing warns you.
 
 ## Reconciliation workflow

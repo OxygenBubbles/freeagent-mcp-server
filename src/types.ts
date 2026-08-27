@@ -32,6 +32,10 @@ export interface BankTransactionExplanation {
   marked_for_review: boolean;
   type?: string;
   attachment?: string;
+  project?: string;
+  rebill_type?: "cost" | "markup" | "price";
+  rebill_factor?: string;
+  ec_status?: string;
 }
 
 export interface BankTransaction {
@@ -88,6 +92,9 @@ export interface Expense {
   rebill_type?: "cost" | "markup" | "price";
   rebill_factor?: string;
   ec_status?: string;
+  receipt_reference?: string;
+  /** Set once the expense has been billed on to a client, and the URL of that invoice. */
+  rebilled_on_invoice?: string;
   // Mileage-category expenses only
   mileage?: string;
   vehicle_type?: string;

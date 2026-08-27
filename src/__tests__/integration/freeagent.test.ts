@@ -522,3 +522,139 @@ describe("replaceAttachment", () => {
     ).rejects.toThrow(/^upload timed out$/);
   });
 });
+
+// ── Bank transaction rebilling ───────────────────────────────────────────────
+
+/**
+ * A bank transaction rebills exactly as an expense does. Until these fields
+ * existed, a payment tagged to a project but with rebilling switched off could
+ * not be corrected through the MCP at all — and it is invisible in a listing
+ * too, so the client invoice just comes out short.
+ */
+describe("updateExplanation rebilling", () => {
+  async function freshModule() {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    mockedPut.mockResolvedValue({
+      data: {
+        bank_transaction_explanation: {
+          url: "https://api.freeagent.com/v2/bank_transaction_explanations/5",
+          marked_for_review: false,
+        },
+      },
+    } as never);
+    return fa;
+  }
+
+  it("sets the project and rebill type", async () => {
+    const fa = await freshModule();
+    await fa.updateExplanation({
+      explanationId: "5",
+      projectUrl: "/v2/projects/123",
+      rebillType: "cost",
+    });
+
+    const [, body] = mockedPut.mock.calls[0];
+    expect(body).toEqual({
+      bank_transaction_explanation: {
+        project: "https://api.freeagent.com/v2/projects/123",
+        rebill_type: "cost",
+      },
+    });
+  });
+
+  it("carries a markup factor", async () => {
+    const fa = await freshModule();
+    await fa.updateExplanation({
+      explanationId: "5",
+      rebillType: "markup",
+      rebillFactor: "15.0",
+    });
+
+    const [, body] = mockedPut.mock.calls[0] as [string, Record<string, Record<string, unknown>>];
+    expect(body["bank_transaction_explanation"]).toMatchObject({
+      rebill_type: "markup",
+      rebill_factor: "15.0",
+    });
+  });
+
+  it("turns rebilling off with an empty string", async () => {
+    const fa = await freshModule();
+    await fa.updateExplanation({ explanationId: "5", rebillType: "", projectUrl: "" });
+
+    const [, body] = mockedPut.mock.calls[0] as [string, Record<string, Record<string, unknown>>];
+    expect(body["bank_transaction_explanation"]).toEqual({
+      project: null,
+      rebill_type: null,
+    });
+  });
+
+  it("leaves rebilling alone when not mentioned", async () => {
+    const fa = await freshModule();
+    await fa.updateExplanation({ explanationId: "5", description: "IONOS hosting" });
+
+    const [, body] = mockedPut.mock.calls[0] as [string, Record<string, Record<string, unknown>>];
+    expect(body["bank_transaction_explanation"]).toEqual({ description: "IONOS hosting" });
+  });
+
+  it("rejects a cross-type reference for the project", async () => {
+    const fa = await freshModule();
+    await expect(
+      fa.updateExplanation({ explanationId: "5", projectUrl: "/v2/contacts/1" })
+    ).rejects.toThrow();
+    expect(mockedPut).not.toHaveBeenCalled();
+  });
+});
+
+// ── Listing expenses ─────────────────────────────────────────────────────────
+
+describe("listExpenses", () => {
+  it("passes the documented filters through as query parameters", async () => {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    mockedGet.mockResolvedValue({ data: { expenses: [] } } as never);
+
+    await fa.listExpenses({
+      fromDate: "2026-04-01",
+      toDate: "2026-04-30",
+      projectUrl: "/v2/projects/123",
+    });
+
+    const [, config] = mockedGet.mock.calls[0] as [string, { params: Record<string, unknown> }];
+    expect(config.params).toMatchObject({
+      from_date: "2026-04-01",
+      to_date: "2026-04-30",
+      project: "https://api.freeagent.com/v2/projects/123",
+    });
+  });
+
+  it("omits the view parameter for 'all', which FreeAgent does not define", async () => {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    mockedGet.mockResolvedValue({ data: { expenses: [] } } as never);
+
+    await fa.listExpenses({ view: "all" });
+
+    const [, config] = mockedGet.mock.calls[0] as [string, { params: Record<string, unknown> }];
+    expect(config.params).not.toHaveProperty("view");
+  });
+
+  it("extracts a numeric id for each expense", async () => {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    mockedGet.mockResolvedValue({
+      data: {
+        expenses: [
+          { url: "https://api.freeagent.com/v2/expenses/77", gross_value: "-22.80" },
+        ],
+      },
+    } as never);
+
+    const { items } = await fa.listExpenses();
+    expect(items[0]!.id).toBe("77");
+  });
+});

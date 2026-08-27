@@ -515,6 +515,13 @@ export async function updateExplanation(opts: {
   description?: string;
   category?: string;
   markExplained?: boolean;
+  /** "" clears the project tag. */
+  projectUrl?: string;
+  /** "" stops the transaction being rebilled. */
+  rebillType?: "cost" | "markup" | "price" | "";
+  rebillFactor?: string;
+  ecStatus?: EcStatus;
+  salesTaxRate?: string;
 }): Promise<BankTransactionExplanation> {
   const body: Record<string, unknown> = {};
   if (opts.description !== undefined) body["description"] = opts.description;
@@ -522,6 +529,17 @@ export async function updateExplanation(opts: {
     body["category"] = resolveCategoryUrl(opts.category);
   }
   if (opts.markExplained) body["marked_for_review"] = false;
+  // A bank transaction rebills exactly as an expense does; without these the
+  // only way to correct a mis-rebilled payment was the FreeAgent UI.
+  if (opts.projectUrl !== undefined) {
+    body["project"] = opts.projectUrl === "" ? null : resolveProjectUrl(opts.projectUrl);
+  }
+  if (opts.rebillType !== undefined) {
+    body["rebill_type"] = opts.rebillType === "" ? null : opts.rebillType;
+  }
+  if (opts.rebillFactor !== undefined) body["rebill_factor"] = opts.rebillFactor;
+  if (opts.ecStatus) body["ec_status"] = opts.ecStatus;
+  if (opts.salesTaxRate) body["sales_tax_rate"] = opts.salesTaxRate;
 
   const data = await faPut<{ bank_transaction_explanation: BankTransactionExplanation }>(
     `/bank_transaction_explanations/${opts.explanationId}`,
@@ -1103,6 +1121,39 @@ export async function createExpense(opts: {
   const data = await faPost<{ expense: Expense }>("/expenses", body);
   const expense = data.expense;
   return { ...expense, id: extractId(expense) };
+}
+
+/**
+ * List expenses.
+ *
+ * FreeAgent publishes no "unbilled" view for expenses — only `recent` and
+ * `recurring` — so the rebillable/unbilled split is computed by the caller
+ * from `rebilled_on_invoice`, which the API sets once a cost has been billed on.
+ */
+export async function listExpenses(opts: {
+  fromDate?: string;
+  toDate?: string;
+  view?: "all" | "recent" | "recurring";
+  projectUrl?: string;
+  userUrl?: string;
+  updatedSince?: string;
+  limit?: number;
+} = {}): Promise<PagedResult<Expense>> {
+  const params: Record<string, unknown> = {};
+  if (opts.fromDate) params["from_date"] = opts.fromDate;
+  if (opts.toDate) params["to_date"] = opts.toDate;
+  if (opts.view && opts.view !== "all") params["view"] = opts.view;
+  if (opts.projectUrl) params["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.userUrl) params["user"] = resolveUserUrl(opts.userUrl);
+  if (opts.updatedSince) params["updated_since"] = opts.updatedSince;
+
+  const { items, mayHaveMore } = await faGetPaged<Expense>(
+    "/expenses",
+    "expenses",
+    params,
+    opts.limit ?? DEFAULT_LIST_LIMIT
+  );
+  return { items: items.map((e) => ({ ...e, id: extractId(e) })), mayHaveMore };
 }
 
 // ── Mileage expenses ─────────────────────────────────────────────────────────

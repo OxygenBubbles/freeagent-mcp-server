@@ -12,8 +12,8 @@ The FreeAgent OAuth credentials grant **full access** to the connected FreeAgent
 |--------|------------------|
 | Read bank accounts | `freeagent_list_bank_accounts` |
 | Read bank transactions and explanations | `freeagent_list_transactions` |
-| Update transaction explanations (category, description, approval, attachments) | `freeagent_explain_transaction` |
-| Create, amend and delete expense claims | `freeagent_create_expense`, `freeagent_create_mileage_expense`, `freeagent_update_expense`, `freeagent_delete_expense` |
+| Update transaction explanations (category, description, project, rebilling, VAT, approval, attachments) | `freeagent_explain_transaction` |
+| Read, create, amend and delete expense claims | `freeagent_list_expenses`, `freeagent_create_expense`, `freeagent_create_mileage_expense`, `freeagent_update_expense`, `freeagent_delete_expense` |
 | Read the chart of accounts | `freeagent_list_categories` |
 | Read, create, amend and delete projects | `freeagent_list_projects`, `freeagent_create_project`, `freeagent_update_project`, `freeagent_delete_project` |
 | Read, create, amend and delete contacts | `freeagent_list_contacts`, `freeagent_create_contact`, `freeagent_update_contact`, `freeagent_delete_contact` |
@@ -52,8 +52,9 @@ When both are connected, Claude will search all of them automatically for matchi
 |------|-------------|
 | `freeagent_list_bank_accounts` | List all bank accounts and their IDs |
 | `freeagent_list_transactions` | List transactions (unexplained / explained / all / marked_for_review) with date filters |
-| `freeagent_explain_transaction` | Update, approve or attach a receipt to a transaction explanation |
+| `freeagent_explain_transaction` | Update, approve, rebill or attach a receipt to a transaction explanation |
 | `freeagent_list_categories` | List the full chart of accounts — all four category groups |
+| `freeagent_list_expenses` | List expense claims by date or project, with `unbilledOnly` for costs queued to bill on and `untaggedRebillOnly` for project-tagged costs that will never be billed |
 | `freeagent_create_expense` | Create an expense claim with optional receipt (local path, URL or base64), project tag with rebill type/factor, EC VAT status and bank-transaction auto-matching |
 | `freeagent_update_expense` | Update an existing expense — attach or replace the receipt, set the rebill treatment, retag project/category, correct date, amount or VAT |
 | `freeagent_create_mileage_expense` | Create a mileage claim with engine type/size for fuel VAT, optionally rebilled to a project; the rate comes from the account's own mileage settings |
@@ -224,6 +225,10 @@ That IONOS expense should be Reverse Charge, not UK/Non-EC — fix it
 Log 24 miles for a client visit from the office to a customer site on 10 April
 
 Add a line to draft invoice 4471 for 2 days' consultancy at £650
+
+Which April expenses are tagged to a project but not set to rebill?
+
+Show me everything queued to bill on to Example Client that isn't on an invoice yet
 ```
 
 ---

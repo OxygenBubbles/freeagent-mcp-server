@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   createExpense,
+  listExpenses,
   updateExpense,
   deleteExpense,
   getExpense,
@@ -24,6 +25,11 @@ import { dateSchema, invalid, ok, fail } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
 const FILE_BASE64_MAX = 10_000_000;
+
+// FreeAgent rejects an expense description over 255 characters. The schema
+// used to allow 1000, so a long one round-tripped to the API and failed there
+// instead of being caught here with a message naming the limit.
+const EXPENSE_DESCRIPTION_MAX = 255;
 
 // Category reference: the "/v2/categories/<id>" path form or the full API URL.
 const CATEGORY_PATH_REGEX =
@@ -80,6 +86,129 @@ export function registerExpenseTools(server: McpServer): void {
     }
   );
 
+  // ── List expenses ───────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_list_expenses",
+    {
+      description:
+        "List FreeAgent expense claims for a date range, with what each one is tagged and rebilled to.\n\n" +
+        "Use this to find money owed back, to check which costs are queued to bill on to a client, and " +
+        "to spot expenses tagged to a project but NOT set to rebill — those are attributed to the client " +
+        "yet will never appear on an invoice.\n\n" +
+        "unbilledOnly=true narrows to expenses set to rebill that have not yet been billed on an invoice. " +
+        "Totals cover only the expenses fetched; check mayHaveMore before treating one as complete.",
+      inputSchema: z
+        .object({
+          fromDate: dateSchema("Earliest expense date YYYY-MM-DD").optional(),
+          toDate: dateSchema("Latest expense date YYYY-MM-DD").optional(),
+          project: z
+            .string()
+            .regex(PROJECT_PATH_REGEX, "Must be a FreeAgent project path like /v2/projects/123")
+            .optional()
+            .describe("Only expenses tagged to this project"),
+          view: z
+            .enum(["all", "recent", "recurring"])
+            .default("all")
+            .describe("FreeAgent's own view filter (default: all)"),
+          unbilledOnly: z
+            .boolean()
+            .default(false)
+            .describe(
+              "Only expenses set to rebill that have not yet been billed on an invoice. " +
+              "FreeAgent publishes no such view, so this is applied to the fetched results."
+            ),
+          untaggedRebillOnly: z
+            .boolean()
+            .default(false)
+            .describe(
+              "Only expenses tagged to a project but with no rebill type — the ones attributed to a " +
+              "client that will silently never be billed on."
+            ),
+          limit: z
+            .number()
+            .int()
+            .positive()
+            .max(1000)
+            .default(100)
+            .describe("Maximum expenses to fetch (default 100, max 1000)"),
+        })
+        .strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+      // NOTE: this check is NOT a schema-level .refine(). Calling .refine() on
+      // the object turns it into a ZodEffects, which the MCP SDK cannot read a
+      // .shape from — it then advertises an EMPTY inputSchema, so clients see
+      // no parameters and send none. Cross-field rules belong in the handler.
+    async (args) => {
+      try {
+        if (args.unbilledOnly && args.untaggedRebillOnly) {
+          return invalid(
+            "unbilledOnly and untaggedRebillOnly select opposite things — an expense set to rebill " +
+            "cannot also have no rebill type. Ask for one or the other."
+          );
+        }
+        if (args.fromDate && args.toDate && args.fromDate > args.toDate) {
+          return invalid(`fromDate ${args.fromDate} is after toDate ${args.toDate}.`);
+        }
+
+        const { items, mayHaveMore } = await listExpenses({
+          fromDate: args.fromDate,
+          toDate: args.toDate,
+          view: args.view,
+          projectUrl: args.project,
+          limit: args.limit,
+        });
+
+        const rows = items
+          .map((e) => ({
+            id: e.id,
+            url: e.url,
+            dated_on: e.dated_on,
+            description: e.description,
+            gross_value: e.gross_value,
+            currency: e.currency,
+            category: e.category,
+            project: e.project ?? null,
+            rebill_type: e.rebill_type ?? null,
+            rebill_factor: e.rebill_factor ?? null,
+            // Set by FreeAgent once the cost has been billed on to a client.
+            rebilled_on_invoice: e.rebilled_on_invoice ?? null,
+            has_attachment: Boolean(e.attachment),
+            receipt_reference: e.receipt_reference ?? null,
+          }))
+          .filter((r) => {
+            if (args.unbilledOnly) return Boolean(r.rebill_type) && !r.rebilled_on_invoice;
+            if (args.untaggedRebillOnly) return Boolean(r.project) && !r.rebill_type;
+            return true;
+          });
+
+        // Claims are stored negative (money owed to the claimant); report the
+        // magnitude, which is what someone reconciling a total expects.
+        const total = rows.reduce((sum, r) => sum + Math.abs(Number(r.gross_value) || 0), 0);
+
+        return ok({
+          expenses: rows,
+          count: rows.length,
+          totalForReturned: total.toFixed(2),
+          mayHaveMore,
+          ...(mayHaveMore
+            ? {
+                warning:
+                  `More than the ${args.limit} expenses fetched exist, so totalForReturned is ` +
+                  "partial and a filter may have missed matches. Raise limit (up to 1000) or narrow the dates.",
+              }
+            : {}),
+          ...(rows.length === 0
+            ? { note: "No expenses matched. Widen the date range or drop the filters." }
+            : {}),
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
   server.registerTool(
     "freeagent_create_expense",
     {
@@ -110,8 +239,11 @@ export function registerExpenseTools(server: McpServer): void {
           description: z
             .string()
             .min(1)
-            .max(1000)
-            .describe("Expense description (e.g. 'Monthly cloud hosting')"),
+            .max(EXPENSE_DESCRIPTION_MAX)
+            .describe(
+              "Expense description (e.g. 'Monthly cloud hosting'). Sent as " +
+              `"vendor — description", which must be ${EXPENSE_DESCRIPTION_MAX} characters or fewer in total.`
+            ),
           currency: z
             .string()
             .regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP")
@@ -245,6 +377,17 @@ export function registerExpenseTools(server: McpServer): void {
           );
         }
 
+        // "vendor — description" is what gets sent, so a description that fits
+        // on its own can still overflow once the vendor is prepended.
+        const composedDescription = `${args.vendor} — ${args.description}`;
+        if (composedDescription.length > EXPENSE_DESCRIPTION_MAX) {
+          return invalid(
+            `Description is sent as "vendor — description", which comes to ${composedDescription.length} ` +
+            `characters; FreeAgent's limit is ${EXPENSE_DESCRIPTION_MAX}. Shorten the description by ` +
+            `${composedDescription.length - EXPENSE_DESCRIPTION_MAX}.`
+          );
+        }
+
         // Resolve category
         const categoryUrl = args.categoryUrl ?? lookupCategory(args.vendor);
         if (!categoryUrl) {
@@ -279,7 +422,7 @@ export function registerExpenseTools(server: McpServer): void {
         const expense = await createExpense({
           categoryUrl,
           datedOn: args.datedOn,
-          description: `${args.vendor} — ${args.description}`,
+          description: composedDescription,
           grossValue: args.grossAmount,
           currency: args.currency,
           salesTaxRate: args.vatRate,
@@ -448,9 +591,9 @@ export function registerExpenseTools(server: McpServer): void {
           description: z
             .string()
             .min(1)
-            .max(1000)
+            .max(EXPENSE_DESCRIPTION_MAX)
             .optional()
-            .describe("Replacement description"),
+            .describe(`Replacement description (max ${EXPENSE_DESCRIPTION_MAX} characters)`),
           datedOn: dateSchema("Corrected expense date YYYY-MM-DD").optional(),
           grossAmount: z
             .string()
