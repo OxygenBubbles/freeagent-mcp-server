@@ -215,11 +215,15 @@ Add to `claude_desktop_config.json`:
 ```
 List my unexplained Starling transactions for April 2026
 
-Approve explanation 12345678 and attach the base64 receipt
+Approve explanation 12345678 and attach the receipt at ~/Downloads/invoice.pdf
 
-Create an expense for the £22.80 IONOS charge on 3 April — here's the PDF: <base64>
+Create an expense for the £22.80 IONOS charge on 3 April, rebilled to the Example Client project at cost — the receipt is at ~/Desktop/ionos.png
+
+That IONOS expense should be Reverse Charge, not UK/Non-EC — fix it
 
 Log 24 miles for a client visit from the office to a customer site on 10 April
+
+Add a line to draft invoice 4471 for 2 days' consultancy at £650
 ```
 
 ---
@@ -299,6 +303,9 @@ Always set `AUTH_TOKEN` when exposing HTTP mode — every request must include `
 - FreeAgent tokens are cached in memory and refreshed automatically
 - Transactions are never approved without a confirmed receipt or explicit instruction
 - The server never creates new categories — only selects from existing ones
+- Receipt URLs are fetched through an SSRF guard: the address validated is the address dialled, every redirect hop is re-checked, proxies are bypassed and downloads are size-capped
+- Local receipt paths must be absolute and are resolved through symlinks before use; in HTTP mode they are refused unless `FREEAGENT_ATTACHMENT_ROOTS` names the directories that may be read
+- The three deletes whose loss is unrecoverable — expenses, contacts and projects — require `confirm: true` in addition to the client's own prompt
 - `.mcp.json` is excluded from git via `.gitignore`
 
 ---

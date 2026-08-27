@@ -6,12 +6,12 @@
     "url": "https://github.com/OxygenBubbles/freeagent-mcp-server",
     "source": "github"
   },
-  "version": "3.0.1",
+  "version": "3.1.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@oxygenbubbles/freeagent-mcp-server",
-      "version": "3.0.1",
+      "version": "3.1.0",
       "transport": {
         "type": "stdio"
       },
