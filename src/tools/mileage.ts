@@ -1,6 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { createMileageExpense, handleFAError } from "../services/freeagent.js";
+import {
+  createMileageExpense,
+  getMileageRate,
+  handleFAError,
+} from "../services/freeagent.js";
 import {
   calculateDistance,
   isDistanceConfigured,
@@ -14,7 +18,7 @@ import {
   HMRC_RATE_LOW_PENCE,
   HMRC_THRESHOLD_MILES,
 } from "../constants.js";
-import { dateSchema } from "./respond.js";
+import { dateSchema, invalid } from "./respond.js";
 
 // 249 is "Mileage" in FreeAgent's standard chart of accounts. The previous
 // default (311) does not exist there, so every mileage claim was rejected.
@@ -102,6 +106,32 @@ export function registerMileageTools(server: McpServer): void {
             .enum(["Car", "Motorcycle", "Bicycle"])
             .default("Car")
             .describe("Vehicle used for the journey (required by FreeAgent's mileage category)"),
+          engineType: z
+            .enum([
+              "Petrol",
+              "Diesel",
+              "LPG",
+              "Electric",
+              "Electric (Home charger)",
+              "Electric (Public charger)",
+            ])
+            .optional()
+            .describe(
+              "Fuel or power type. Needed with engineSize to reclaim the VAT on the fuel element " +
+              "of the claim — without them FreeAgent has nothing to calculate it from."
+            ),
+          engineSize: z
+            .string()
+            .max(50)
+            .optional()
+            .describe(
+              "Engine size band as FreeAgent labels it (e.g. 'Up to 1400cc', '1401-2000cc', " +
+              "'Over 2000cc', 'All'). The valid bands vary by date and engine type."
+            ),
+          haveVatReceipt: z
+            .boolean()
+            .optional()
+            .describe("Whether a VAT receipt for the fuel was kept — required to reclaim the VAT"),
           project: z
             .string()
             .regex(
@@ -110,6 +140,19 @@ export function registerMileageTools(server: McpServer): void {
             )
             .optional()
             .describe("FreeAgent project URL to tag the journey against"),
+          rebillType: z
+            .enum(["cost", "markup", "price"])
+            .optional()
+            .describe(
+              "How to rebill this to the client — 'cost' bills it on at cost, 'markup' adds a " +
+              "percentage, 'price' charges a fixed price. Requires project. Without it the expense " +
+              "is attributed to the project but never queued to bill on."
+            ),
+          rebillFactor: z
+            .string()
+            .regex(/^\d+(\.\d+)?$/, "Numeric string, e.g. '15.0'")
+            .optional()
+            .describe("Markup percentage or fixed price — required for markup/price"),
           cumulativeMilesYTD: z
             .number()
             .min(0)
@@ -134,6 +177,31 @@ export function registerMileageTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        if (args.rebillType && !args.project) {
+          return invalid(
+            "rebillType needs a project — FreeAgent rebills a journey to the project it is tagged against."
+          );
+        }
+        if (
+          (args.rebillType === "markup" || args.rebillType === "price") &&
+          !args.rebillFactor
+        ) {
+          return invalid(
+            `rebillType '${args.rebillType}' needs rebillFactor (the markup percentage or fixed price).`
+          );
+        }
+
+        if (Boolean(args.engineType) !== Boolean(args.engineSize)) {
+          return invalid(
+            "engineType and engineSize go together — FreeAgent needs both to work out the VAT on the fuel."
+          );
+        }
+        if (args.haveVatReceipt && !args.engineType) {
+          return invalid(
+            "haveVatReceipt needs engineType and engineSize — without them FreeAgent cannot calculate the reclaimable VAT, so recording the receipt alone achieves nothing."
+          );
+        }
+
         // ── Resolve distance ──────────────────────────────────────────────
         let miles: number;
         let journeyDetail: string;
@@ -173,21 +241,64 @@ export function registerMileageTools(server: McpServer): void {
           journeyDetail += " (round trip)";
         }
 
-        // ── Advisory estimate ─────────────────────────────────────────────
-        // FreeAgent computes the actual claim from the account's own mileage
-        // rate. This estimate is returned alongside it so a mismatch with the
-        // caller's expectation (or HMRC AMAP rates) is visible.
+        // ── Estimate ──────────────────────────────────────────────────────
+        // FreeAgent files the claim at the rate configured on the account, so
+        // ask it what that rate is rather than guessing and reporting the
+        // difference afterwards. A caller-supplied ratePence still wins, and
+        // MILEAGE_RATE_PENCE / the HMRC bands remain the fallback for an
+        // account whose settings cannot be read.
         let estimatePounds: string;
         let breakdown: string;
         let ratePence: number | undefined;
+        let estimateSource:
+          | "argument"
+          | "freeagent_mileage_settings"
+          | "MILEAGE_RATE_PENCE"
+          | "hmrc_defaults";
+        const notes: string[] = [];
+
+        const published = args.ratePence
+          ? null
+          : await getMileageRate(args.datedOn, args.vehicleType);
 
         const explicitRate = args.ratePence ?? getDefaultRate();
-        if (explicitRate) {
+
+        if (args.ratePence) {
+          ratePence = args.ratePence;
+          estimatePounds = (Math.round(miles * ratePence) / 100).toFixed(2);
+          breakdown = `${miles} miles @ ${ratePence}p/mile`;
+          estimateSource = "argument";
+        } else if (published) {
+          estimateSource = "freeagent_mileage_settings";
+          const banded =
+            published.subsequentRatePence !== undefined &&
+            published.thresholdMiles !== undefined;
+          if (banded) {
+            if (args.cumulativeMilesYTD === undefined) {
+              notes.push(
+                `The rate steps down after ${published.thresholdMiles} miles in the tax year. ` +
+                "No cumulativeMilesYTD was given, so the estimate assumes none claimed yet; " +
+                "FreeAgent's own figure accounts for the miles already filed."
+              );
+            }
+            const calc = calculateHMRCMileage(miles, args.cumulativeMilesYTD ?? 0, {
+              highPence: published.initialRatePence,
+              lowPence: published.subsequentRatePence!,
+              thresholdMiles: published.thresholdMiles!,
+            });
+            estimatePounds = calc.amountPounds;
+            breakdown = `${calc.breakdown} (FreeAgent mileage settings)`;
+            if (calc.type === "single") ratePence = calc.ratePence;
+          } else {
+            ratePence = published.initialRatePence;
+            estimatePounds = (Math.round(miles * ratePence) / 100).toFixed(2);
+            breakdown = `${miles} miles @ ${ratePence}p/mile (FreeAgent mileage settings)`;
+          }
+        } else if (explicitRate) {
           ratePence = explicitRate;
           estimatePounds = (Math.round(miles * ratePence) / 100).toFixed(2);
-          breakdown =
-            `${miles} miles @ ${ratePence}p/mile` +
-            (args.ratePence ? "" : " (MILEAGE_RATE_PENCE)");
+          breakdown = `${miles} miles @ ${ratePence}p/mile (MILEAGE_RATE_PENCE)`;
+          estimateSource = "MILEAGE_RATE_PENCE";
         } else {
           const rates = getHMRCRates();
           const calc = calculateHMRCMileage(
@@ -198,6 +309,7 @@ export function registerMileageTools(server: McpServer): void {
           estimatePounds = calc.amountPounds;
           breakdown = calc.breakdown;
           if (calc.type === "single") ratePence = calc.ratePence;
+          estimateSource = "hmrc_defaults";
         }
 
         // ── File the claim ────────────────────────────────────────────────
@@ -208,19 +320,32 @@ export function registerMileageTools(server: McpServer): void {
           miles,
           vehicleType: args.vehicleType,
           currency: args.currency,
+          engineType: args.engineType,
+          engineSize: args.engineSize,
+          haveVatReceipt: args.haveVatReceipt,
           projectUrl: args.project,
+          rebillType: args.rebillType,
+          rebillFactor: args.rebillFactor,
         });
 
         // FreeAgent records claims as negative (money owed to the claimant).
         const filedAmount = expense.gross_value;
         const filedMagnitude = Math.abs(parseFloat(filedAmount)).toFixed(2);
-        const notes: string[] = [];
         if (filedMagnitude !== estimatePounds) {
           notes.push(
             `FreeAgent filed £${filedMagnitude} using the mileage rate configured on the account; ` +
             `the estimate from ${breakdown} was £${estimatePounds}.`
           );
         }
+        if (estimateSource === "hmrc_defaults" || estimateSource === "MILEAGE_RATE_PENCE") {
+          notes.push(
+            "FreeAgent's own mileage settings could not be read, so the estimate uses " +
+            (estimateSource === "MILEAGE_RATE_PENCE"
+              ? "MILEAGE_RATE_PENCE."
+              : "the built-in HMRC rates.")
+          );
+        }
+
 
         const payload = {
           success: true,
@@ -232,9 +357,16 @@ export function registerMileageTools(server: McpServer): void {
           rateApplied: expense.reclaim_mileage_rate ?? null,
           estimate: estimatePounds,
           estimateBasis: breakdown,
+          estimateSource,
           estimateRatePence: ratePence,
           journey: journeyDetail,
+          engineType: args.engineType ?? null,
+          engineSize: args.engineSize ?? null,
+          haveVatReceipt: args.haveVatReceipt ?? null,
           project: args.project ?? null,
+          rebill: args.rebillType
+            ? { type: args.rebillType, factor: args.rebillFactor ?? null }
+            : null,
           cumulativeMilesAfter:
             args.cumulativeMilesYTD === undefined
               ? undefined

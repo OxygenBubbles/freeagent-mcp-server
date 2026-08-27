@@ -13,20 +13,23 @@ The FreeAgent OAuth credentials grant **full access** to the connected FreeAgent
 | Read bank accounts | `freeagent_list_bank_accounts` |
 | Read bank transactions and explanations | `freeagent_list_transactions` |
 | Update transaction explanations (category, description, approval, attachments) | `freeagent_explain_transaction` |
-| Create expense claims | `freeagent_create_expense`, `freeagent_create_mileage_expense` |
-| Read the chart of accounts and projects | `freeagent_list_categories`, `freeagent_list_projects` |
-| Read and create contacts | `freeagent_list_contacts`, `freeagent_create_contact` |
-| Read, raise and change the status of invoices | `freeagent_list_invoices`, `freeagent_get_invoice`, `freeagent_create_invoice`, `freeagent_update_invoice_status` |
-| Read and record supplier bills | `freeagent_list_bills`, `freeagent_create_bill` |
-| Read and log time against project tasks | `freeagent_list_tasks`, `freeagent_create_task`, `freeagent_list_timeslips`, `freeagent_create_timeslip` |
+| Create, amend and delete expense claims | `freeagent_create_expense`, `freeagent_create_mileage_expense`, `freeagent_update_expense`, `freeagent_delete_expense` |
+| Read the chart of accounts | `freeagent_list_categories` |
+| Read, create, amend and delete projects | `freeagent_list_projects`, `freeagent_create_project`, `freeagent_update_project`, `freeagent_delete_project` |
+| Read, create, amend and delete contacts | `freeagent_list_contacts`, `freeagent_create_contact`, `freeagent_update_contact`, `freeagent_delete_contact` |
+| Read, raise, edit and change the status of invoices | `freeagent_list_invoices`, `freeagent_get_invoice`, `freeagent_create_invoice`, `freeagent_update_invoice`, `freeagent_update_invoice_status` |
+| Read, record and amend supplier bills | `freeagent_list_bills`, `freeagent_get_bill`, `freeagent_create_bill`, `freeagent_update_bill` |
+| Read, log and amend time against project tasks | `freeagent_list_tasks`, `freeagent_create_task`, `freeagent_update_task`, `freeagent_list_timeslips`, `freeagent_create_timeslip`, `freeagent_update_timeslip` |
 | Read accounting reports | `freeagent_profit_and_loss`, `freeagent_trial_balance`, `freeagent_aged_debtors`, `freeagent_aged_creditors`, `freeagent_tax_timeline`, `freeagent_company_summary` |
-| Delete invoices, bills and timeslips | `freeagent_delete_invoice`, `freeagent_delete_bill`, `freeagent_delete_timeslip` |
+| Delete expenses, invoices, bills, contacts, projects, tasks and timeslips | `freeagent_delete_expense`, `freeagent_delete_invoice`, `freeagent_delete_bill`, `freeagent_delete_contact`, `freeagent_delete_project`, `freeagent_delete_task`, `freeagent_delete_timeslip` |
 
 FreeAgent does not offer granular OAuth scopes — authorising an app grants access to all of the above.
 
-**Destructive operations.** The delete tools are flagged `destructiveHint: true` so your MCP client can prompt before running them, as is `freeagent_update_invoice_status` (its `mark_as_cancelled` transition voids an issued invoice). The server never deletes bank transactions or contacts, and never emails anything to your clients — status transitions change status only.
+**Destructive operations.** The delete tools are flagged `destructiveHint: true` so your MCP client can prompt before running them, as is `freeagent_update_invoice_status` (its `mark_as_cancelled` transition voids an issued invoice). The three whose loss is unrecoverable — `freeagent_delete_expense`, `freeagent_delete_contact` and `freeagent_delete_project` — additionally require `confirm: true`, so a client that auto-approves tool calls still cannot trigger them by accident. The server never deletes bank transactions, and never emails anything to your clients — status transitions change status only.
 
-**Outbound fetches.** `freeagent_explain_transaction` accepts a `fileUrl` to download a receipt. That URL is treated as untrusted input: only `http`/`https` are allowed, hosts resolving to loopback, link-local, or private addresses are refused (on the initial request *and* on every redirect), and downloads are capped at 10 MB.
+**Outbound fetches.** `freeagent_explain_transaction`, `freeagent_create_expense`, `freeagent_update_expense`, `freeagent_create_bill` and `freeagent_update_bill` each accept a `fileUrl` to download a receipt or invoice. That URL is treated as untrusted input: only `http`/`https` are allowed, hosts resolving to loopback, link-local, or private addresses are refused (on the initial request *and* on every redirect), and downloads are capped at 10 MB.
+
+**Local file reads.** Those same tools accept a `filePath`, and the server reads that file from the host it runs on. The path must be absolute, and symlinks are resolved before the check. Over stdio the server runs as you, so this is no more access than the client already has. In **HTTP mode the caller is remote**, so local paths are refused outright unless you set `FREEAGENT_ATTACHMENT_ROOTS` to the directories that may be read (colon-separated); anything outside them is refused. Set it in stdio mode too if you want to bound what a prompt-injected model can attach.
 
 **Truncation.** List tools page through results and report `mayHaveMore`; when true, any total they return covers only the records fetched and is named `totalOutstandingForReturned`. The `freeagent_aged_debtors` and `freeagent_aged_creditors` reports page to exhaustion and return `complete: true` — treat `complete: false` as an incomplete figure. Records whose due date is missing or unparseable are counted in a separate `unknown_due_date` bucket rather than being assumed not yet due.
 
@@ -51,23 +54,29 @@ When both are connected, Claude will search all of them automatically for matchi
 | `freeagent_list_transactions` | List transactions (unexplained / explained / all / marked_for_review) with date filters |
 | `freeagent_explain_transaction` | Update, approve or attach a receipt to a transaction explanation |
 | `freeagent_list_categories` | List the full chart of accounts — all four category groups |
-| `freeagent_list_projects` | List projects, for tagging expenses, invoices, bills and time |
-| `freeagent_create_expense` | Create an expense claim with optional receipt attachment, project tag and bank-transaction auto-matching |
-| `freeagent_create_mileage_expense` | Create a mileage claim; FreeAgent calculates the value from the account's mileage rate |
+| `freeagent_create_expense` | Create an expense claim with optional receipt (local path, URL or base64), project tag with rebill type/factor, EC VAT status and bank-transaction auto-matching |
+| `freeagent_update_expense` | Update an existing expense — attach or replace the receipt, set the rebill treatment, retag project/category, correct date, amount or VAT |
+| `freeagent_create_mileage_expense` | Create a mileage claim with engine type/size for fuel VAT, optionally rebilled to a project; the rate comes from the account's own mileage settings |
+| `freeagent_delete_expense` | Delete an expense filed in error (needs `confirm: true`) |
 
 ### Contacts, invoicing and bills
 
 | Tool | Description |
 |------|-------------|
 | `freeagent_list_contacts` | List clients and suppliers, with an optional name/email filter |
-| `freeagent_create_contact` | Create a client or supplier |
+| `freeagent_create_contact` | Create a client or supplier, with VAT registration number and default payment terms |
+| `freeagent_update_contact` | Update a contact, add its VAT number, or hide it (`status: "Hidden"`) |
+| `freeagent_delete_contact` | Delete a contact (needs `confirm: true`) |
 | `freeagent_list_invoices` | List invoices by view (`overdue`, `open_or_overdue`, `draft`, `paid`…) with the total outstanding |
 | `freeagent_get_invoice` | Fetch one invoice in full, including line items |
-| `freeagent_create_invoice` | Raise an invoice with line items — always created as a **draft** |
+| `freeagent_create_invoice` | Raise an invoice with line items and EC VAT status — always created as a **draft** |
+| `freeagent_update_invoice` | Edit a draft invoice — dates, project, VAT status, discount, and add/edit/remove line items |
 | `freeagent_update_invoice_status` | Mark an invoice as sent, draft, scheduled or cancelled (no email is sent) |
 | `freeagent_delete_invoice` | Delete an invoice |
 | `freeagent_list_bills` | List supplier bills with the total outstanding |
-| `freeagent_create_bill` | Record a supplier bill, with optional PDF attachment and project allocation |
+| `freeagent_get_bill` | Fetch one bill in full, including line items and their URLs (needed to edit lines) |
+| `freeagent_create_bill` | Record a supplier bill, with optional invoice attachment (local path, URL or base64), EC VAT status, project allocation and rebill treatment |
+| `freeagent_update_bill` | Update a bill — reference, dates, VAT status, project, rebill treatment, attachment and line items |
 | `freeagent_delete_bill` | Delete a bill |
 
 ### Time tracking
@@ -76,9 +85,21 @@ When both are connected, Claude will search all of them automatically for matchi
 |------|-------------|
 | `freeagent_list_tasks` | List project tasks (time is always logged against a task) |
 | `freeagent_create_task` | Create a project task with its billing rate |
+| `freeagent_update_task` | Rename a task, change its billing rate, or close it (`status: "Completed"`) |
+| `freeagent_delete_task` | Delete a task with no time logged against it |
 | `freeagent_list_timeslips` | List logged time for a date range, with totals per project; `view: "unbilled"` finds uninvoiced work |
 | `freeagent_create_timeslip` | Log time against a project task |
+| `freeagent_update_timeslip` | Correct a timeslip's hours, date, task or comment |
 | `freeagent_delete_timeslip` | Delete a timeslip |
+
+### Projects
+
+| Tool | Description |
+|------|-------------|
+| `freeagent_list_projects` | List projects, for tagging expenses, invoices, bills and time |
+| `freeagent_create_project` | Create a project against a client contact — only contact and name are required |
+| `freeagent_update_project` | Rename, rebudget, change billing rate or close a project |
+| `freeagent_delete_project` | Delete a project with nothing booked against it (needs `confirm: true`) |
 
 ### Reporting
 
@@ -139,13 +160,14 @@ All settings are read from environment variables.
 |----------|-------------|
 | `VENDOR_CATEGORIES` | JSON object extending the built-in vendor → category mapping (see below) |
 | `MILEAGE_CATEGORY_URL` | FreeAgent category URL for mileage expenses (default `/v2/categories/249`, the standard Mileage category) |
-| `MILEAGE_RATE_PENCE` | Fixed pence-per-mile rate used for the advisory estimate (FreeAgent still calculates the filed amount) |
-| `HMRC_RATE_HIGH_PENCE` | HMRC high-band rate in pence for the advisory estimate (default `45`) |
-| `HMRC_RATE_LOW_PENCE` | HMRC low-band rate in pence for the advisory estimate (default `25`) |
+| `MILEAGE_RATE_PENCE` | Fallback pence-per-mile rate for the estimate, used only when FreeAgent's own mileage settings cannot be read |
+| `HMRC_RATE_HIGH_PENCE` | HMRC high-band rate in pence, used as a last-resort fallback (default `45`) |
+| `HMRC_RATE_LOW_PENCE` | HMRC low-band rate in pence, used as a last-resort fallback (default `25`) |
 | `HMRC_THRESHOLD_MILES` | Miles per tax year before the low band kicks in (default `10000`) |
 | `ORS_API_KEY` | [OpenRouteService](https://openrouteservice.org) API key for drive-distance lookups |
 | `GOOGLE_MAPS_API_KEY` | Google Maps API key for drive-distance lookups (alternative to ORS) |
 | `PORT` | If set, serves over HTTP on this port instead of stdio |
+| `FREEAGENT_ATTACHMENT_ROOTS` | Colon-separated directories that `filePath` attachments may be read from. Required for local paths in HTTP mode; optional (and recommended) over stdio |
 | `AUTH_TOKEN` | Bearer token required on every HTTP request. Strongly recommended whenever `PORT` is set |
 | `FREEAGENT_DEBUG` | Set to `1` to log every request and error response to stderr. Tokens, credentials and file payloads are redacted |
 
@@ -206,11 +228,22 @@ Log 24 miles for a client visit from the office to a customer site on 10 April
 
 Mileage is a special FreeAgent category: you submit the **miles and vehicle type**, and FreeAgent calculates the claim value from the mileage rate configured on the account. That figure is what appears in your accounts and HMRC reporting, so the server does not attempt to override it.
 
-`ratePence`, `MILEAGE_RATE_PENCE`, `cumulativeMilesYTD` and the `HMRC_*` variables produce an **advisory estimate** returned alongside the filed amount. When the two differ, the response says so:
+The estimate returned alongside the filed amount uses that same rate: the server reads `GET /v2/expenses/mileage_settings` and applies the band published for the journey's date and vehicle. The response records where the rate came from in `estimateSource`:
 
-> FreeAgent filed £46.20 using the mileage rate configured on the account; the estimate from 84 miles @ 45p/mile (HMRC) was £37.80.
+| `estimateSource` | Meaning |
+|------------------|---------|
+| `freeagent_mileage_settings` | The account's own published rate — the normal case |
+| `argument` | A `ratePence` you passed explicitly, which always wins |
+| `MILEAGE_RATE_PENCE` | Settings could not be read; the environment variable was used |
+| `hmrc_defaults` | Settings could not be read and no override was set; the built-in HMRC bands were used |
 
-That is a useful check: HMRC's approved rates are 45p/mile for the first 10,000 business miles in the tax year and 25p above it, and anything paid above the approved rate is a taxable benefit. If the two figures disagree, check the mileage rate in your FreeAgent settings.
+The last two are fallbacks, and the response says so in `notes`. When the estimate and the filed amount still differ, that is worth a look:
+
+> FreeAgent filed £46.20 using the mileage rate configured on the account; the estimate from 84 miles @ 45p/mile (FreeAgent mileage settings) was £37.80.
+
+HMRC's approved rates are 45p/mile for the first 10,000 business miles in the tax year and 25p above it, and anything paid above the approved rate is a taxable benefit.
+
+To reclaim the VAT on the fuel element, pass `engineType` and `engineSize` (and `haveVatReceipt`) — FreeAgent cannot calculate it without them.
 
 ---
 

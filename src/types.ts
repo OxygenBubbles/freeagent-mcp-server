@@ -82,8 +82,12 @@ export interface Expense {
   sales_tax_value?: string;
   currency: string;
   manual_sales_tax_amount?: string;
-  attachment?: string;
+  /** FreeAgent returns the attachment as an object, not a bare URL. */
+  attachment?: { url: string; file_name?: string; content_type?: string };
   project?: string;
+  rebill_type?: "cost" | "markup" | "price";
+  rebill_factor?: string;
+  ec_status?: string;
   // Mileage-category expenses only
   mileage?: string;
   vehicle_type?: string;

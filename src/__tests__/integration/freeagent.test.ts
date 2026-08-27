@@ -243,3 +243,282 @@ describe("handleFAError", () => {
     expect(freeagent.handleFAError("plain string")).toMatch(/plain string/);
   });
 });
+
+// ── Mileage settings ─────────────────────────────────────────────────────────
+
+/**
+ * The rate FreeAgent will actually apply, read from the account rather than
+ * guessed. The payload is date-ranged and its inner shape has changed before,
+ * so the lookup has to degrade to null instead of filing a claim against a
+ * number it half-understood.
+ */
+describe("getMileageRate", () => {
+  async function withSettings(payload: unknown) {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    mockedGet.mockResolvedValue({ data: payload } as never);
+    return fa;
+  }
+
+  it("reads a banded car rate for the date", async () => {
+    const fa = await withSettings({
+      mileage_settings: {
+        mileage_rates: [
+          {
+            from: "2011-04-06",
+            to: null,
+            value: {
+              car: { initial_rate: 0.45, subsequent_rate: 0.25, threshold: 10000 },
+              motorcycle: { initial_rate: 0.24 },
+            },
+          },
+        ],
+      },
+    });
+
+    expect(await fa.getMileageRate("2026-04-15", "Car")).toEqual({
+      initialRatePence: 45,
+      subsequentRatePence: 25,
+      thresholdMiles: 10000,
+    });
+  });
+
+  it("accepts a rate already quoted in pence", async () => {
+    const fa = await withSettings({
+      mileage_settings: {
+        mileage_rates: [{ from: "2011-04-06", value: { car: { initial_rate: "45" } } }],
+      },
+    });
+    expect(await fa.getMileageRate("2026-04-15", "Car")).toEqual({
+      initialRatePence: 45,
+      subsequentRatePence: undefined,
+      thresholdMiles: undefined,
+    });
+  });
+
+  it("picks the window covering the date, not the newest entry", async () => {
+    const fa = await withSettings({
+      mileage_settings: {
+        mileage_rates: [
+          { from: "2002-04-06", to: "2011-04-05", value: { car: { initial_rate: 0.4 } } },
+          { from: "2011-04-06", to: null, value: { car: { initial_rate: 0.45 } } },
+        ],
+      },
+    });
+    const old = await fa.getMileageRate("2010-06-01", "Car");
+    expect(old?.initialRatePence).toBe(40);
+  });
+
+  it("matches the vehicle key whatever its case or plural", async () => {
+    const fa = await withSettings({
+      mileage_settings: {
+        mileage_rates: [{ from: "2011-04-06", value: { Motorcycles: 0.24 } }],
+      },
+    });
+    expect((await fa.getMileageRate("2026-04-15", "Motorcycle"))?.initialRatePence).toBe(24);
+  });
+
+  it("returns null for a shape it does not recognise", async () => {
+    const fa = await withSettings({ mileage_settings: { mileage_rates: "unexpected" } });
+    expect(await fa.getMileageRate("2026-04-15", "Car")).toBeNull();
+  });
+
+  it("returns null when the vehicle has no published rate", async () => {
+    const fa = await withSettings({
+      mileage_settings: { mileage_rates: [{ from: "2011-04-06", value: { car: 0.45 } }] },
+    });
+    expect(await fa.getMileageRate("2026-04-15", "Bicycle")).toBeNull();
+  });
+
+  it("returns null rather than throwing when the request fails", async () => {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    mockedGet.mockRejectedValue(new Error("500") as never);
+    expect(await fa.getMileageRate("2026-04-15", "Car")).toBeNull();
+  });
+
+  it("returns null when no published window covers the journey date", async () => {
+    const fa = await withSettings({
+      mileage_settings: {
+        mileage_rates: [
+          { from: "2025-04-06", to: "2026-04-05", value: { car: { initial_rate: 0.45 } } },
+        ],
+      },
+    });
+
+    // Falling back to the newest entry would file a historical journey at a
+    // rate that did not exist yet; the caller's own rates are the better answer.
+    expect(await fa.getMileageRate("2024-04-15", "Car")).toBeNull();
+  });
+
+  it("coalesces concurrent misses into one request", async () => {
+    const fa = await withSettings({
+      mileage_settings: {
+        mileage_rates: [{ from: "2011-04-06", value: { car: { initial_rate: 0.45 } } }],
+      },
+    });
+
+    const [a, b] = await Promise.all([
+      fa.getMileageRate("2026-04-15", "Car"),
+      fa.getMileageRate("2026-04-16", "Car"),
+    ]);
+
+    expect(a).toEqual(b);
+    expect(mockedGet).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not poison the cache with a failed request", async () => {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    mockedGet.mockRejectedValueOnce(new Error("503") as never);
+    expect(await fa.getMileageRate("2026-04-15", "Car")).toBeNull();
+
+    mockedGet.mockResolvedValue({
+      data: {
+        mileage_settings: {
+          mileage_rates: [{ from: "2011-04-06", value: { car: { initial_rate: 0.45 } } }],
+        },
+      },
+    } as never);
+    expect((await fa.getMileageRate("2026-04-15", "Car"))?.initialRatePence).toBe(45);
+  });
+
+  it("caches the settings across lookups", async () => {
+    const fa = await withSettings({
+      mileage_settings: {
+        mileage_rates: [{ from: "2011-04-06", value: { car: { initial_rate: 0.45 } } }],
+      },
+    });
+    await fa.getMileageRate("2026-04-15", "Car");
+    await fa.getMileageRate("2026-05-15", "Car");
+    expect(mockedGet).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Update and delete paths ──────────────────────────────────────────────────
+
+describe("update and delete requests", () => {
+  async function freshModule() {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    return fa;
+  }
+
+  it("PUTs an expense update to the right path", async () => {
+    const fa = await freshModule();
+    mockedPut.mockResolvedValue({
+      data: { expense: { url: "https://api.freeagent.com/v2/expenses/7", gross_value: "-22.80" } },
+    } as never);
+
+    await fa.updateExpense("7", { rebillType: "cost" });
+
+    const [url, body] = mockedPut.mock.calls[0];
+    expect(url).toContain("/v2/expenses/7");
+    expect(body).toEqual({ expense: { rebill_type: "cost" } });
+  });
+
+  it("refuses a non-numeric id before spending a request", async () => {
+    const fa = await freshModule();
+    await expect(fa.updateExpense("7; DROP", { rebillType: "cost" })).rejects.toThrow(
+      /Invalid expense ID/
+    );
+    expect(mockedPut).not.toHaveBeenCalled();
+  });
+
+  it("attaches to a bill through the bills collection", async () => {
+    const fa = await freshModule();
+    mockedPut.mockResolvedValue({
+      data: { bill: { attachment: { url: "https://api.freeagent.com/v2/attachments/3" } } },
+    } as never);
+
+    await fa.uploadAttachment({
+      entityId: "12",
+      entityType: "bill",
+      fileName: "invoice.pdf",
+      contentType: "application/pdf",
+      fileBase64: "AAAA",
+    });
+
+    expect(mockedPut.mock.calls[0][0]).toContain("/v2/bills/12");
+  });
+
+  it("deletes an existing bill attachment before replacing it", async () => {
+    const fa = await freshModule();
+    mockedGet.mockResolvedValue({
+      data: { bill: { attachment: { url: "https://api.freeagent.com/v2/attachments/9" } } },
+    } as never);
+    const mockedDelete = vi.mocked(axios.delete);
+    mockedDelete.mockResolvedValue({ data: {} } as never);
+
+    expect(await fa.deleteExistingAttachment("12", "bill")).toBe(true);
+    expect(mockedDelete.mock.calls[0][0]).toContain("/v2/attachments/9");
+  });
+});
+
+// ── Attachment replacement ───────────────────────────────────────────────────
+
+/**
+ * FreeAgent will not overwrite an attachment via PUT, so the old one must be
+ * deleted first. That leaves a window where a failed upload strands the record
+ * with no receipt at all — the one outcome the caller must not mistake for
+ * "nothing happened".
+ */
+describe("replaceAttachment", () => {
+  const FILE = {
+    fileName: "receipt.pdf",
+    contentType: "application/pdf",
+    fileBase64: "AAAA",
+  };
+
+  async function freshModule() {
+    vi.resetModules();
+    const fa = await import("../../services/freeagent.js");
+    mockTokenRefresh();
+    return fa;
+  }
+
+  it("reports that the previous attachment was replaced", async () => {
+    const fa = await freshModule();
+    mockedGet.mockResolvedValue({
+      data: { expense: { attachment: { url: "https://api.freeagent.com/v2/attachments/9" } } },
+    } as never);
+    vi.mocked(axios.delete).mockResolvedValue({ data: {} } as never);
+    mockedPut.mockResolvedValue({
+      data: { expense: { attachment: { url: "https://api.freeagent.com/v2/attachments/10" } } },
+    } as never);
+
+    const result = await fa.replaceAttachment({
+      entityId: "7",
+      entityType: "expense",
+      ...FILE,
+    });
+    expect(result.replaced).toBe(true);
+  });
+
+  it("says the record is now receiptless when the upload fails after a delete", async () => {
+    const fa = await freshModule();
+    mockedGet.mockResolvedValue({
+      data: { expense: { attachment: { url: "https://api.freeagent.com/v2/attachments/9" } } },
+    } as never);
+    vi.mocked(axios.delete).mockResolvedValue({ data: {} } as never);
+    mockedPut.mockRejectedValue(new Error("upload timed out") as never);
+
+    await expect(
+      fa.replaceAttachment({ entityId: "7", entityType: "expense", ...FILE })
+    ).rejects.toThrow(/now has no attachment.*upload timed out/s);
+  });
+
+  it("surfaces the plain error when there was nothing to delete", async () => {
+    const fa = await freshModule();
+    mockedGet.mockResolvedValue({ data: { expense: {} } } as never);
+    mockedPut.mockRejectedValue(new Error("upload timed out") as never);
+
+    await expect(
+      fa.replaceAttachment({ entityId: "7", entityType: "expense", ...FILE })
+    ).rejects.toThrow(/^upload timed out$/);
+  });
+});

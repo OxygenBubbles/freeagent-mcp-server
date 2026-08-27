@@ -12,6 +12,13 @@ import {
   buildAgeingBuckets,
   resolveContactUrl,
   resolveTaskUrl,
+  buildContactUpdateBody,
+  buildInvoiceUpdateBody,
+  buildBillUpdateBody,
+  buildTaskUpdateBody,
+  buildTimeslipUpdateBody,
+  buildProjectBody,
+  buildProjectUpdateBody,
 } from "../../services/freeagent.js";
 
 const CONTACT = "https://api.freeagent.com/v2/contacts/1";
@@ -52,6 +59,24 @@ describe("buildContactBody", () => {
   it("omits empty strings rather than sending blanks", () => {
     const { contact } = buildContactBody({ organisationName: "Acme", town: "" });
     expect(contact).not.toHaveProperty("town");
+  });
+});
+
+describe("buildContactBody VAT registration", () => {
+  it("sends the contact's VAT number and default terms", () => {
+    const { contact } = buildContactBody({
+      organisationName: "Example Client GmbH",
+      salesTaxRegistrationNumber: "DE123456789",
+      defaultPaymentTermsInDays: 14,
+    });
+    expect(contact["sales_tax_registration_number"]).toBe("DE123456789");
+    expect(contact["default_payment_terms_in_days"]).toBe(14);
+  });
+
+  it("omits them when not supplied", () => {
+    const { contact } = buildContactBody({ organisationName: "Example Client Ltd" });
+    expect(contact).not.toHaveProperty("sales_tax_registration_number");
+    expect(contact).not.toHaveProperty("default_payment_terms_in_days");
   });
 });
 
@@ -134,6 +159,91 @@ describe("buildInvoiceBody", () => {
     expect(() => buildInvoiceBody({ ...base, contactUrl: "/v2/projects/1" })).toThrow(
       /Invalid contact/
     );
+  });
+});
+
+describe("buildInvoiceBody VAT treatment", () => {
+  const base = {
+    contactUrl: "/v2/contacts/1",
+    datedOn: "2026-08-04",
+    paymentTermsInDays: 30,
+    items: [
+      { description: "Consultancy", itemType: "Services", price: "750.00", quantity: "4.0" },
+    ],
+  };
+
+  it("omits ec_status unless asked, leaving FreeAgent's UK/Non-EC default", () => {
+    const { invoice } = buildInvoiceBody(base);
+    expect(invoice).not.toHaveProperty("ec_status");
+  });
+
+  it("sends ec_status for a sale to an overseas client", () => {
+    const { invoice } = buildInvoiceBody({ ...base, ecStatus: "Reverse Charge" });
+    expect(invoice["ec_status"]).toBe("Reverse Charge");
+  });
+
+  it("refuses EC VAT MOSS without a place of supply", () => {
+    expect(() => buildInvoiceBody({ ...base, ecStatus: "EC VAT MOSS" })).toThrow(
+      /placeOfSupply/
+    );
+  });
+
+  it("sends the place of supply alongside MOSS", () => {
+    const { invoice } = buildInvoiceBody({
+      ...base,
+      ecStatus: "EC VAT MOSS",
+      placeOfSupply: "Germany",
+    });
+    expect(invoice["place_of_supply"]).toBe("Germany");
+  });
+
+  it("marks an exempt line", () => {
+    const { invoice } = buildInvoiceBody({
+      ...base,
+      items: [{ ...base.items[0], salesTaxStatus: "EXEMPT" as const }],
+    });
+    expect((invoice["invoice_items"] as Array<Record<string, unknown>>)[0]["sales_tax_status"])
+      .toBe("EXEMPT");
+  });
+});
+
+describe("buildBillBody VAT treatment", () => {
+  const base = {
+    contactUrl: "/v2/contacts/1",
+    reference: "INV-2049",
+    datedOn: "2026-08-04",
+    dueOn: "2026-09-03",
+    items: [{ categoryUrl: "/v2/categories/285", totalValue: "120.00" }],
+  };
+
+  it("omits ec_status unless asked", () => {
+    const { bill } = buildBillBody(base);
+    expect(bill).not.toHaveProperty("ec_status");
+  });
+
+  it("sends ec_status for an overseas supplier", () => {
+    const { bill } = buildBillBody({ ...base, ecStatus: "EC Goods" });
+    expect(bill["ec_status"]).toBe("EC Goods");
+  });
+
+  it("carries quantity, unit and tax status on a line", () => {
+    const { bill } = buildBillBody({
+      ...base,
+      items: [
+        {
+          categoryUrl: "/v2/categories/285",
+          totalValue: "120.00",
+          quantity: "2",
+          unit: "Hours",
+          salesTaxStatus: "OUT_OF_SCOPE" as const,
+        },
+      ],
+    });
+    expect((bill["bill_items"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      quantity: "2",
+      unit: "Hours",
+      sales_tax_status: "OUT_OF_SCOPE",
+    });
   });
 });
 
@@ -351,5 +461,256 @@ describe("ageing refuses missing amounts", () => {
         "2026-08-06"
       )
     ).toThrow(/Refusing to treat a missing amount as zero/);
+  });
+});
+
+describe("buildContactUpdateBody", () => {
+  it("updates a single field without needing a name", () => {
+    const { contact } = buildContactUpdateBody({ salesTaxRegistrationNumber: "DE123456789" });
+    expect(contact).toEqual({ sales_tax_registration_number: "DE123456789" });
+  });
+
+  it("hides a contact", () => {
+    const { contact } = buildContactUpdateBody({ status: "Hidden" });
+    expect(contact["status"]).toBe("Hidden");
+  });
+
+  it("renames when a name is given", () => {
+    const { contact } = buildContactUpdateBody({ organisationName: "Renamed Ltd" });
+    expect(contact["organisation_name"]).toBe("Renamed Ltd");
+  });
+
+  it("refuses an empty update", () => {
+    expect(() => buildContactUpdateBody({})).toThrow(/Nothing to update/);
+  });
+});
+
+describe("buildInvoiceUpdateBody", () => {
+  it("sends only what was named", () => {
+    const { invoice } = buildInvoiceUpdateBody({ comments: "Chased by phone" });
+    expect(invoice).toEqual({ comments: "Chased by phone" });
+  });
+
+  it("edits a line by its own url and leaves the rest alone", () => {
+    const { invoice } = buildInvoiceUpdateBody({
+      items: [{ itemUrl: "/v2/invoice_items/9", price: "800.00" }],
+    });
+    expect(invoice["invoice_items"]).toEqual([
+      { url: "https://api.freeagent.com/v2/invoice_items/9", price: "800.00" },
+    ]);
+  });
+
+  it("removes a line with _destroy", () => {
+    const { invoice } = buildInvoiceUpdateBody({
+      items: [{ itemUrl: "/v2/invoice_items/9", destroy: true }],
+    });
+    expect(invoice["invoice_items"]).toEqual([
+      { url: "https://api.freeagent.com/v2/invoice_items/9", _destroy: 1 },
+    ]);
+  });
+
+  it("refuses to remove a line it cannot address", () => {
+    expect(() => buildInvoiceUpdateBody({ items: [{ destroy: true }] })).toThrow(/itemUrl/);
+  });
+
+  it("refuses a new line with no description or price", () => {
+    expect(() => buildInvoiceUpdateBody({ items: [{ quantity: "1.0" }] })).toThrow(
+      /needs both description and price/
+    );
+  });
+
+  it("rejects a malformed price rather than coercing it", () => {
+    expect(() =>
+      buildInvoiceUpdateBody({
+        items: [{ itemUrl: "/v2/invoice_items/9", price: "750.00x" }],
+      })
+    ).toThrow();
+  });
+
+  it("keeps the MOSS place-of-supply rule", () => {
+    expect(() => buildInvoiceUpdateBody({ ecStatus: "EC VAT MOSS" })).toThrow(/placeOfSupply/);
+  });
+
+  it("refuses an empty update", () => {
+    expect(() => buildInvoiceUpdateBody({})).toThrow(/Nothing to update/);
+  });
+});
+
+describe("buildBillUpdateBody", () => {
+  it("sets the VAT status alone", () => {
+    const { bill } = buildBillUpdateBody({ ecStatus: "Reverse Charge" });
+    expect(bill).toEqual({ ec_status: "Reverse Charge" });
+  });
+
+  it("adds a new line, edits one and destroys another", () => {
+    const { bill } = buildBillUpdateBody({
+      items: [
+        { categoryUrl: "/v2/categories/285", totalValue: "60.00", description: "Taxi" },
+        { itemUrl: "/v2/bill_items/4", totalValue: "75.00" },
+        { itemUrl: "/v2/bill_items/5", destroy: true },
+      ],
+    });
+    expect(bill["bill_items"]).toEqual([
+      {
+        category: "https://api.freeagent.com/v2/categories/285",
+        total_value: "60.00",
+        description: "Taxi",
+      },
+      { url: "https://api.freeagent.com/v2/bill_items/4", total_value: "75.00" },
+      { url: "https://api.freeagent.com/v2/bill_items/5", _destroy: 1 },
+    ]);
+  });
+
+  it("refuses a new line missing its category or value", () => {
+    expect(() => buildBillUpdateBody({ items: [{ description: "Taxi" }] })).toThrow(
+      /needs both categoryUrl and totalValue/
+    );
+  });
+
+  it("keeps the positive-value rule on an edited line", () => {
+    expect(() =>
+      buildBillUpdateBody({ items: [{ itemUrl: "/v2/bill_items/4", totalValue: "0.00" }] })
+    ).toThrow(/greater than zero/);
+  });
+
+  it("refuses an empty update", () => {
+    expect(() => buildBillUpdateBody({})).toThrow(/Nothing to update/);
+  });
+});
+
+describe("buildTaskUpdateBody", () => {
+  it("closes a task", () => {
+    const { task } = buildTaskUpdateBody({ status: "Completed" });
+    expect(task).toEqual({ status: "Completed" });
+  });
+
+  it("keeps a false is_billable rather than dropping it", () => {
+    const { task } = buildTaskUpdateBody({ isBillable: false });
+    expect(task["is_billable"]).toBe(false);
+  });
+
+  it("refuses an empty update", () => {
+    expect(() => buildTaskUpdateBody({})).toThrow(/Nothing to update/);
+  });
+});
+
+describe("buildTimeslipUpdateBody", () => {
+  it("corrects the hours", () => {
+    const { timeslip } = buildTimeslipUpdateBody({ hours: "6.25" });
+    expect(timeslip).toEqual({ hours: "6.25" });
+  });
+
+  it("moves the time to another task", () => {
+    const { timeslip } = buildTimeslipUpdateBody({ taskUrl: "/v2/tasks/1" });
+    expect(timeslip["task"]).toBe(TASK);
+  });
+
+  it("rejects hours that are not a positive number", () => {
+    expect(() => buildTimeslipUpdateBody({ hours: "-2" })).toThrow(/Invalid hours/);
+  });
+
+  it("allows clearing the comment", () => {
+    const { timeslip } = buildTimeslipUpdateBody({ comment: "" });
+    expect(timeslip).toEqual({ comment: "" });
+  });
+
+  it("refuses an empty update", () => {
+    expect(() => buildTimeslipUpdateBody({})).toThrow(/Nothing to update/);
+  });
+});
+
+describe("buildProjectBody", () => {
+  const base = { contactUrl: "/v2/contacts/1", name: "Example Client Ltd — Q3" };
+
+  it("fills in the attributes FreeAgent requires", () => {
+    const { project } = buildProjectBody(base);
+    expect(project).toEqual({
+      contact: CONTACT,
+      name: "Example Client Ltd — Q3",
+      currency: "GBP",
+      budget: 0,
+      budget_units: "Hours",
+      status: "Active",
+      uses_project_invoice_sequence: false,
+    });
+  });
+
+  it("carries the optional engagement details", () => {
+    const { project } = buildProjectBody({
+      ...base,
+      budget: 20000,
+      budgetUnits: "Monetary",
+      normalBillingRate: "650.00",
+      billingPeriod: "day",
+      isIr35: false,
+      startsOn: "2026-09-01",
+      contractPoReference: "PO-4471",
+    });
+    expect(project).toMatchObject({
+      budget: 20000,
+      budget_units: "Monetary",
+      normal_billing_rate: "650.00",
+      billing_period: "day",
+      is_ir35: false,
+      starts_on: "2026-09-01",
+      contract_po_reference: "PO-4471",
+    });
+  });
+
+  it("rejects a cross-type reference for the contact", () => {
+    expect(() => buildProjectBody({ ...base, contactUrl: "/v2/projects/1" })).toThrow();
+  });
+
+  it("needs a name", () => {
+    expect(() => buildProjectBody({ contactUrl: "/v2/contacts/1", name: "  " })).toThrow(
+      /needs a name/
+    );
+  });
+});
+
+describe("buildProjectUpdateBody", () => {
+  it("closes a project without touching its budget", () => {
+    const { project } = buildProjectUpdateBody({ status: "Completed" });
+    expect(project).toEqual({ status: "Completed" });
+  });
+
+  it("keeps a zero budget rather than dropping it", () => {
+    const { project } = buildProjectUpdateBody({ budget: 0 });
+    expect(project).toEqual({ budget: 0 });
+  });
+
+  it("refuses an empty update", () => {
+    expect(() => buildProjectUpdateBody({})).toThrow(/Nothing to update/);
+  });
+});
+
+describe("clearing optional contact fields", () => {
+  it("drops a blank on create — a blank field is noise, not an instruction", () => {
+    const { contact } = buildContactBody({ organisationName: "Acme", town: "" });
+    expect(contact).not.toHaveProperty("town");
+  });
+
+  it("clears the same field on update, where a blank means 'remove this'", () => {
+    const { contact } = buildContactUpdateBody({ salesTaxRegistrationNumber: "" });
+    expect(contact).toEqual({ sales_tax_registration_number: null });
+  });
+
+  it("never sends the internal clearEmpty flag to FreeAgent", () => {
+    const { contact } = buildContactUpdateBody({ town: "Sometown" });
+    expect(contact).not.toHaveProperty("clearEmpty");
+  });
+});
+
+describe("line item URLs are validated by collection", () => {
+  it("rejects a bill item URL passed as an invoice line", () => {
+    expect(() =>
+      buildInvoiceUpdateBody({ items: [{ itemUrl: "/v2/bill_items/9", destroy: true }] })
+    ).toThrow();
+  });
+
+  it("rejects an invoice item URL passed as a bill line", () => {
+    expect(() =>
+      buildBillUpdateBody({ items: [{ itemUrl: "/v2/invoice_items/9", destroy: true }] })
+    ).toThrow();
   });
 });

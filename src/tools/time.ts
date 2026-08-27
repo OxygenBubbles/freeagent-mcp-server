@@ -3,12 +3,15 @@ import { z } from "zod";
 import {
   listTasks,
   createTask,
+  updateTask,
+  deleteTask,
   listTimeslips,
   createTimeslip,
+  updateTimeslip,
   deleteTimeslip,
 } from "../services/freeagent.js";
 import { parseStrictDecimal } from "../utils/money.js";
-import { ok, fail, resourceRegex, dateSchema } from "./respond.js";
+import { ok, fail, invalid, resourceRegex, dateSchema } from "./respond.js";
 
 const PROJECT_REF = resourceRegex("projects");
 const TASK_REF = resourceRegex("tasks");
@@ -301,6 +304,165 @@ export function registerTimeTools(server: McpServer): void {
       try {
         await deleteTimeslip(args.timeslipId);
         return ok({ success: true, deletedTimeslipId: args.timeslipId });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  // ── Update task ─────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_update_task",
+    {
+      description:
+        "Update a FreeAgent project task — rename it, change its billing rate or period, make it " +
+        "billable or not, or close it by setting status to 'Completed'. " +
+        "A task cannot move between projects. Only the fields you pass are changed.",
+      inputSchema: z
+        .object({
+          taskId: z
+            .string()
+            .regex(/^\d+$/, "Numeric task ID")
+            .describe("Numeric FreeAgent task ID"),
+          name: z.string().min(1).max(200).optional().describe("Task name"),
+          isBillable: z.boolean().optional().describe("Whether time on this task is billable"),
+          billingRate: z
+            .string()
+            .regex(/^\d+(\.\d{1,2})?$/, "Decimal string, e.g. '650.00'")
+            .optional()
+            .describe("Rate charged for time on this task"),
+          billingPeriod: z
+            .enum(["hour", "day"])
+            .optional()
+            .describe("Whether the billing rate is per hour or per day"),
+          currency: z
+            .string()
+            .regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP")
+            .optional()
+            .describe("ISO 4217 currency for the billing rate"),
+          status: z
+            .enum(["Active", "Completed", "Hidden"])
+            .optional()
+            .describe("Task status"),
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+    },
+    async (args) => {
+      try {
+        const { taskId, ...changes } = args;
+        const named = Object.entries(changes).filter(([, v]) => v !== undefined);
+        if (named.length === 0) {
+          return invalid("Nothing to update — supply at least one field to change.");
+        }
+        const task = await updateTask(taskId, changes);
+        return ok({
+          success: true,
+          taskId: task.id,
+          taskUrl: task.url,
+          name: task.name,
+          status: task.status ?? null,
+          is_billable: task.is_billable ?? null,
+          billing_rate: task.billing_rate ?? null,
+          changed: named.map(([k]) => k),
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  // ── Delete task ─────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_delete_task",
+    {
+      description:
+        "Delete a FreeAgent project task. FreeAgent refuses if time is logged against it — " +
+        "set status to 'Completed' or 'Hidden' via freeagent_update_task to retire a task with history.",
+      inputSchema: z
+        .object({
+          taskId: z
+            .string()
+            .regex(/^\d+$/, "Numeric task ID")
+            .describe("Numeric FreeAgent task ID"),
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+      },
+    },
+    async (args) => {
+      try {
+        await deleteTask(args.taskId);
+        return ok({ success: true, deletedTaskId: args.taskId });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  // ── Update timeslip ─────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_update_timeslip",
+    {
+      description:
+        "Correct a logged timeslip — change the hours, the date, the task it sits under, or its comment. " +
+        "Only the fields you pass are changed. FreeAgent refuses once the time has been billed on an invoice.",
+      inputSchema: z
+        .object({
+          timeslipId: z
+            .string()
+            .regex(/^\d+$/, "Numeric timeslip ID")
+            .describe("FreeAgent timeslip ID"),
+          task: z
+            .string()
+            .regex(TASK_REF, "Must be a task path like /v2/tasks/123")
+            .optional()
+            .describe("Move the time to a different task on the same project"),
+          datedOn: dateSchema("Date the work was done YYYY-MM-DD").optional(),
+          hours: z
+            .string()
+            .regex(/^\d+(\.\d+)?$/, "Numeric string, e.g. '7.5'")
+            .optional()
+            .describe("Corrected hours as a decimal string (e.g. '7.5' for 7h30m)"),
+          comment: z.string().max(1000).optional().describe("What the time was spent on"),
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+    },
+    async (args) => {
+      try {
+        const { timeslipId, task, ...rest } = args;
+        const named = Object.entries(rest).filter(([, v]) => v !== undefined);
+        if (named.length === 0 && !task) {
+          return invalid("Nothing to update — supply at least one field to change.");
+        }
+        const timeslip = await updateTimeslip(timeslipId, {
+          ...rest,
+          ...(task ? { taskUrl: task } : {}),
+        });
+        return ok({
+          success: true,
+          timeslipId: timeslip.id,
+          timeslipUrl: timeslip.url,
+          dated_on: timeslip.dated_on,
+          hours: timeslip.hours,
+          task: timeslip.task,
+          changed: named.map(([k]) => k).concat(task ? ["task"] : []),
+        });
       } catch (err) {
         return fail(err);
       }

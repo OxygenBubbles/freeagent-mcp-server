@@ -1,6 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { listContacts, createContact } from "../services/freeagent.js";
+import {
+  listContacts,
+  createContact,
+  updateContact,
+  getContact,
+  deleteContact,
+} from "../services/freeagent.js";
 import { ok, fail, invalid } from "./respond.js";
 
 /** Human-readable name for a contact, which may be a person, an org, or both. */
@@ -110,6 +116,21 @@ export function registerContactTools(server: McpServer): void {
           region: z.string().max(100).optional().describe("County, region or state"),
           postcode: z.string().max(20).optional().describe("Postcode or ZIP"),
           country: z.string().max(100).optional().describe("Country (e.g. 'United Kingdom')"),
+          salesTaxRegistrationNumber: z
+            .string()
+            .max(50)
+            .optional()
+            .describe(
+              "The contact's VAT registration number (e.g. 'DE123456789'). Required on the invoice " +
+              "for a reverse-charge sale, and for the EC Sales List."
+            ),
+          defaultPaymentTermsInDays: z
+            .number()
+            .int()
+            .min(0)
+            .max(365)
+            .optional()
+            .describe("Default payment terms for this contact's invoices, in days"),
           chargeSalesTax: z
             .enum(["Auto", "Always", "Never"])
             .optional()
@@ -118,6 +139,10 @@ export function registerContactTools(server: McpServer): void {
             .boolean()
             .optional()
             .describe("Show the person's name rather than the organisation on invoices"),
+          status: z
+            .enum(["Active", "Hidden"])
+            .optional()
+            .describe("Contact status (default Active)"),
         })
         .strict(),
       annotations: {
@@ -142,6 +167,130 @@ export function registerContactTools(server: McpServer): void {
           contactUrl: contact.url,
           name: displayName(contact),
           status: contact.status,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  // ── Update ──────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_update_contact",
+    {
+      description:
+        "Update a FreeAgent contact — correct the name or address, add the VAT registration number " +
+        "needed for reverse-charge invoicing, change payment terms, or hide a contact you no longer " +
+        "trade with (status='Hidden'). Only the fields you pass are changed.",
+      inputSchema: z
+        .object({
+          contactId: z
+            .string()
+            .regex(/^\d+$/, "Numeric contact ID")
+            .describe("Numeric FreeAgent contact ID"),
+          organisationName: z.string().max(200).optional().describe("Company name"),
+          firstName: z.string().max(100).optional().describe("Contact first name"),
+          lastName: z.string().max(100).optional().describe("Contact last name"),
+          email: z.string().email().optional().describe("Contact email address"),
+          phoneNumber: z.string().max(50).optional().describe("Contact phone number"),
+          address1: z.string().max(200).optional().describe("First line of the address"),
+          address2: z.string().max(200).optional().describe("Second line of the address"),
+          town: z.string().max(100).optional().describe("Town or city"),
+          region: z.string().max(100).optional().describe("County, region or state"),
+          postcode: z.string().max(20).optional().describe("Postcode or ZIP"),
+          country: z.string().max(100).optional().describe("Country (e.g. 'United Kingdom')"),
+          salesTaxRegistrationNumber: z
+            .string()
+            .max(50)
+            .optional()
+            .describe("The contact's VAT registration number (e.g. 'DE123456789')"),
+          defaultPaymentTermsInDays: z
+            .number()
+            .int()
+            .min(0)
+            .max(365)
+            .optional()
+            .describe("Default payment terms for this contact's invoices, in days"),
+          chargeSalesTax: z
+            .enum(["Auto", "Always", "Never"])
+            .optional()
+            .describe("Whether to charge sales tax to this contact"),
+          contactNameOnInvoices: z
+            .boolean()
+            .optional()
+            .describe("Show the person's name rather than the organisation on invoices"),
+          status: z
+            .enum(["Active", "Hidden"])
+            .optional()
+            .describe("Set to 'Hidden' to retire a contact without deleting it"),
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+    },
+    async (args) => {
+      try {
+        const { contactId, ...changes } = args;
+        const named = Object.entries(changes).filter(([, v]) => v !== undefined);
+        if (named.length === 0) {
+          return invalid("Nothing to update — supply at least one field to change.");
+        }
+        const contact = await updateContact(contactId, changes);
+        return ok({
+          success: true,
+          contactId: contact.id,
+          contactUrl: contact.url,
+          name: displayName(contact),
+          status: contact.status,
+          changed: named.map(([k]) => k),
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  // ── Delete ──────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_delete_contact",
+    {
+      description:
+        "Permanently delete a FreeAgent contact. FreeAgent refuses if anything is filed against them — " +
+        "hide the contact instead (freeagent_update_contact with status='Hidden') to retire one with history.",
+      inputSchema: z
+        .object({
+          contactId: z
+            .string()
+            .regex(/^\d+$/, "Numeric contact ID")
+            .describe("Numeric FreeAgent contact ID"),
+          confirm: z
+            .boolean()
+            .describe("Must be true — deleting a contact cannot be undone."),
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+      },
+    },
+    async (args) => {
+      try {
+        if (!args.confirm) {
+          return invalid("Pass confirm=true to delete the contact — this cannot be undone.");
+        }
+        // Name it in the result: the record is gone by the time the user reads it.
+        const contact = await getContact(args.contactId).catch(() => null);
+        await deleteContact(args.contactId);
+        return ok({
+          success: true,
+          deletedContactId: args.contactId,
+          name: contact ? displayName(contact) : null,
         });
       } catch (err) {
         return fail(err);

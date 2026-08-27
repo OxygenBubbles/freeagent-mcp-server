@@ -421,6 +421,8 @@ export const resolveProjectUrl = makeUrlResolver("projects", "project");
 export const resolveContactUrl = makeUrlResolver("contacts", "contact");
 export const resolveTaskUrl = makeUrlResolver("tasks", "task");
 export const resolveUserUrl = makeUrlResolver("users", "user");
+export const resolveInvoiceItemUrl = makeUrlResolver("invoice_items", "invoice item");
+export const resolveBillItemUrl = makeUrlResolver("bill_items", "bill item");
 
 /**
  * Expense claims are recorded from the claimant's point of view: a negative
@@ -576,9 +578,11 @@ export async function attachToExplanation(opts: {
  * Upload a file (base64) as an attachment to an expense.
  * Expenses use the PUT /expenses/:id endpoint with an inline attachment object.
  */
+export type AttachableEntity = "bank_transaction_explanation" | "expense" | "bill";
+
 export async function uploadAttachment(opts: {
   entityId: string;
-  entityType: "bank_transaction_explanation" | "expense";
+  entityType: AttachableEntity;
   fileName: string;
   contentType: string;
   fileBase64: string;
@@ -597,9 +601,11 @@ export async function uploadAttachment(opts: {
     return resultWithAtt.attachment;
   }
 
-  // Expenses: use PUT /expenses/:id with inline attachment
+  // Expenses and bills: PUT the record with an inline attachment.
+  const root = opts.entityType;
+  const collection = root === "expense" ? "expenses" : "bills";
   const body = {
-    expense: {
+    [root]: {
       attachment: {
         data: opts.fileBase64,
         file_name: opts.fileName,
@@ -608,23 +614,73 @@ export async function uploadAttachment(opts: {
       },
     },
   };
-  const data = await faPut<{ expense: { attachment: Attachment } }>(
-    `/expenses/${opts.entityId}`,
+  const data = await faPut<Record<string, { attachment: Attachment }>>(
+    `/${collection}/${assertNumericId(opts.entityId, root)}`,
     body
   );
-  return data.expense.attachment;
+  const attachment = data[root]?.attachment;
+  if (!attachment) {
+    throw new Error("FreeAgent did not return an attachment after upload.");
+  }
+  return attachment;
 }
 
 /**
- * Remove the attachment currently on a bank transaction explanation, if any.
+ * Replace whatever attachment a record currently has.
+ *
+ * FreeAgent will not overwrite an attachment via PUT, so the old one has to go
+ * first — which means a failed upload leaves the record with nothing. The
+ * bytes are resolved by the caller before this is called, so the window is one
+ * request wide; if it still fails, say so plainly rather than reporting a bare
+ * upload error that reads as "nothing happened".
+ */
+export async function replaceAttachment(opts: {
+  entityId: string;
+  entityType: AttachableEntity;
+  fileName: string;
+  contentType: string;
+  fileBase64: string;
+}): Promise<{ attachment: Attachment; replaced: boolean }> {
+  const replaced = await deleteExistingAttachment(opts.entityId, opts.entityType).catch(
+    () => false
+  );
+  try {
+    const attachment = await uploadAttachment(opts);
+    return { attachment, replaced };
+  } catch (err) {
+    if (replaced) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Uploading ${opts.fileName} failed AFTER the previous attachment was deleted, so the ` +
+        `${opts.entityType} now has no attachment. Re-attach it. Underlying error: ${detail}`
+      );
+    }
+    throw err;
+  }
+}
+
+/** The collection each attachable record lives in. */
+const ATTACHABLE_COLLECTIONS: Record<AttachableEntity, string> = {
+  bank_transaction_explanation: "bank_transaction_explanations",
+  expense: "expenses",
+  bill: "bills",
+};
+
+/**
+ * Remove the attachment currently on a record, if any.
+ *
  * FreeAgent rejects overwriting an attachment via PUT, so the old one must be
  * deleted before attaching a replacement. Returns true if one was removed.
  */
-export async function deleteExistingAttachment(explanationId: string): Promise<boolean> {
-  const data = await faGet<{
-    bank_transaction_explanation: { attachment?: { url: string } };
-  }>(`/bank_transaction_explanations/${explanationId}`);
-  const att = data.bank_transaction_explanation?.attachment;
+export async function deleteExistingAttachment(
+  entityId: string,
+  entityType: AttachableEntity = "bank_transaction_explanation"
+): Promise<boolean> {
+  const collection = ATTACHABLE_COLLECTIONS[entityType];
+  const data = await faGet<Record<string, { attachment?: { url: string } }>>(
+    `/${collection}/${assertNumericId(entityId, entityType)}`
+  );
+  const att = data[entityType]?.attachment;
   if (!att?.url) return false;
   const attId = att.url.split("/").filter(Boolean).pop();
   await faDelete(`/attachments/${attId}`);
@@ -825,6 +881,130 @@ export async function listProjects(
   return { items: items.map((p) => ({ ...p, id: extractId(p) })), mayHaveMore };
 }
 
+export async function getProject(projectId: string): Promise<Project> {
+  const id = assertNumericId(projectId, "project");
+  const data = await faGet<{ project: Project }>(`/projects/${id}`);
+  return { ...data.project, id: extractId(data.project) };
+}
+
+export interface ProjectInput {
+  contactUrl: string;
+  name: string;
+  currency?: string;
+  budget?: number;
+  budgetUnits?: "Hours" | "Days" | "Monetary";
+  status?: "Active" | "Completed" | "Cancelled" | "Hidden";
+  usesProjectInvoiceSequence?: boolean;
+  normalBillingRate?: string;
+  billingPeriod?: "hour" | "day";
+  hoursPerDay?: number;
+  contractPoReference?: string;
+  startsOn?: string;
+  endsOn?: string;
+  isIr35?: boolean;
+  includeUnbilledTimeInProfitability?: boolean;
+}
+
+/**
+ * Build the POST /v2/projects request body.
+ *
+ * FreeAgent requires currency, budget, budget_units and
+ * uses_project_invoice_sequence as well as the name and contact. They are
+ * optional here and defaulted, so the common case — "a project for this
+ * client" — does not need six arguments to say it.
+ */
+export function buildProjectBody(opts: ProjectInput): { project: Record<string, unknown> } {
+  if (!opts.name?.trim()) throw new Error("A project needs a name.");
+
+  const project: Record<string, unknown> = {
+    contact: resolveContactUrl(opts.contactUrl),
+    name: opts.name,
+    currency: opts.currency ?? "GBP",
+    budget: opts.budget ?? 0,
+    budget_units: opts.budgetUnits ?? "Hours",
+    status: opts.status ?? "Active",
+    uses_project_invoice_sequence: opts.usesProjectInvoiceSequence ?? false,
+  };
+
+  if (opts.normalBillingRate !== undefined) {
+    project["normal_billing_rate"] = opts.normalBillingRate;
+  }
+  if (opts.billingPeriod) project["billing_period"] = opts.billingPeriod;
+  if (opts.hoursPerDay !== undefined) project["hours_per_day"] = opts.hoursPerDay;
+  if (opts.contractPoReference) {
+    project["contract_po_reference"] = opts.contractPoReference;
+  }
+  if (opts.startsOn) project["starts_on"] = opts.startsOn;
+  if (opts.endsOn) project["ends_on"] = opts.endsOn;
+  if (opts.isIr35 !== undefined) project["is_ir35"] = opts.isIr35;
+  if (opts.includeUnbilledTimeInProfitability !== undefined) {
+    project["include_unbilled_time_in_profitability"] =
+      opts.includeUnbilledTimeInProfitability;
+  }
+
+  return { project };
+}
+
+export async function createProject(opts: ProjectInput): Promise<Project> {
+  const data = await faPost<{ project: Project }>("/projects", buildProjectBody(opts));
+  return { ...data.project, id: extractId(data.project) };
+}
+
+/**
+ * Build the PUT /v2/projects/:id body — named fields only, so an update
+ * cannot reset the budget or status the caller never mentioned.
+ */
+export function buildProjectUpdateBody(opts: Partial<ProjectInput>): {
+  project: Record<string, unknown>;
+} {
+  const project: Record<string, unknown> = {};
+  if (opts.contactUrl) project["contact"] = resolveContactUrl(opts.contactUrl);
+  if (opts.name) project["name"] = opts.name;
+  if (opts.currency) project["currency"] = opts.currency;
+  if (opts.budget !== undefined) project["budget"] = opts.budget;
+  if (opts.budgetUnits) project["budget_units"] = opts.budgetUnits;
+  if (opts.status) project["status"] = opts.status;
+  if (opts.usesProjectInvoiceSequence !== undefined) {
+    project["uses_project_invoice_sequence"] = opts.usesProjectInvoiceSequence;
+  }
+  if (opts.normalBillingRate !== undefined) {
+    project["normal_billing_rate"] = opts.normalBillingRate;
+  }
+  if (opts.billingPeriod) project["billing_period"] = opts.billingPeriod;
+  if (opts.hoursPerDay !== undefined) project["hours_per_day"] = opts.hoursPerDay;
+  if (opts.contractPoReference !== undefined) {
+    project["contract_po_reference"] = opts.contractPoReference;
+  }
+  if (opts.startsOn) project["starts_on"] = opts.startsOn;
+  if (opts.endsOn) project["ends_on"] = opts.endsOn;
+  if (opts.isIr35 !== undefined) project["is_ir35"] = opts.isIr35;
+  if (opts.includeUnbilledTimeInProfitability !== undefined) {
+    project["include_unbilled_time_in_profitability"] =
+      opts.includeUnbilledTimeInProfitability;
+  }
+
+  if (Object.keys(project).length === 0) {
+    throw new Error("Nothing to update — supply at least one field to change.");
+  }
+  return { project };
+}
+
+export async function updateProject(
+  projectId: string,
+  opts: Partial<ProjectInput>
+): Promise<Project> {
+  const id = assertNumericId(projectId, "project");
+  const data = await faPut<{ project: Project }>(
+    `/projects/${id}`,
+    buildProjectUpdateBody(opts)
+  );
+  return { ...data.project, id: extractId(data.project) };
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  await faDelete(`/projects/${assertNumericId(projectId, "project")}`);
+}
+
 // ── Expenses ─────────────────────────────────────────────────────────────────
 
 export interface ExpenseAttachmentInput {
@@ -833,6 +1013,12 @@ export interface ExpenseAttachmentInput {
   fileBase64: string;
   description?: string;
 }
+
+/**
+ * VAT treatment FreeAgent files the purchase or sale under. Omitted, it
+ * defaults to UK/Non-EC.
+ */
+export type EcStatus = "UK/Non-EC" | "EC Goods" | "EC Services" | "Reverse Charge";
 
 /**
  * Build the POST /v2/expenses request body.
@@ -849,7 +1035,11 @@ export function buildExpenseBody(opts: {
   currency?: string;
   salesTaxRate?: string;
   manualSalesTaxAmount?: string;
+  receiptReference?: string;
   projectUrl?: string;
+  rebillType?: "cost" | "markup" | "price";
+  rebillFactor?: string;
+  ecStatus?: EcStatus;
   attachment?: ExpenseAttachmentInput;
 }): { expense: Record<string, unknown> } {
   const expense: Record<string, unknown> = {
@@ -865,7 +1055,15 @@ export function buildExpenseBody(opts: {
   if (opts.manualSalesTaxAmount) {
     expense["manual_sales_tax_amount"] = opts.manualSalesTaxAmount;
   }
+  if (opts.receiptReference) expense["receipt_reference"] = opts.receiptReference;
   if (opts.projectUrl) expense["project"] = resolveProjectUrl(opts.projectUrl);
+  // Tagging a project attributes the cost to it; without rebill_type the
+  // expense is never queued to bill on, which reads as "rebilled" but isn't.
+  if (opts.rebillType) expense["rebill_type"] = opts.rebillType;
+  if (opts.rebillFactor) expense["rebill_factor"] = opts.rebillFactor;
+  // Left unset, FreeAgent files the purchase as UK/Non-EC — so an overseas
+  // or reverse-charge supplier lands on the VAT return under the wrong box.
+  if (opts.ecStatus) expense["ec_status"] = opts.ecStatus;
   if (opts.attachment) {
     expense["attachment"] = {
       data: opts.attachment.fileBase64,
@@ -886,7 +1084,11 @@ export async function createExpense(opts: {
   currency?: string;
   salesTaxRate?: string;
   manualSalesTaxAmount?: string;
+  receiptReference?: string;
   projectUrl?: string;
+  rebillType?: "cost" | "markup" | "price";
+  rebillFactor?: string;
+  ecStatus?: EcStatus;
   userUrl?: string;
   attachment?: ExpenseAttachmentInput;
 }): Promise<Expense> {
@@ -921,8 +1123,12 @@ export function buildMileageExpenseBody(opts: {
   miles: number;
   vehicleType: VehicleType;
   currency?: string;
+  engineType?: string;
+  engineSize?: string;
+  haveVatReceipt?: boolean;
   projectUrl?: string;
   rebillType?: "cost" | "markup" | "price";
+  rebillFactor?: string;
 }): { expense: Record<string, unknown> } {
   const expense: Record<string, unknown> = {
     user: opts.userUrl,
@@ -934,8 +1140,26 @@ export function buildMileageExpenseBody(opts: {
     reclaim_mileage: 1,
     currency: opts.currency ?? "GBP",
   };
+  // Engine type and size drive the VAT that can be reclaimed on the fuel
+  // element of a mileage claim; without them FreeAgent has nothing to work from.
+  if (Boolean(opts.engineType) !== Boolean(opts.engineSize)) {
+    throw new Error(
+      "engineType and engineSize go together — FreeAgent needs both to work out the VAT on the fuel."
+    );
+  }
+  if (opts.haveVatReceipt && !opts.engineType) {
+    throw new Error(
+      "haveVatReceipt needs engineType and engineSize — without them FreeAgent cannot calculate the reclaimable VAT, and recording the receipt alone achieves nothing."
+    );
+  }
+  if (opts.engineType) expense["engine_type"] = opts.engineType;
+  if (opts.engineSize) expense["engine_size"] = opts.engineSize;
+  if (opts.haveVatReceipt !== undefined) {
+    expense["have_vat_receipt"] = opts.haveVatReceipt;
+  }
   if (opts.projectUrl) expense["project"] = resolveProjectUrl(opts.projectUrl);
   if (opts.rebillType) expense["rebill_type"] = opts.rebillType;
+  if (opts.rebillFactor) expense["rebill_factor"] = opts.rebillFactor;
   return { expense };
 }
 
@@ -946,8 +1170,12 @@ export async function createMileageExpense(opts: {
   miles: number;
   vehicleType: VehicleType;
   currency?: string;
+  engineType?: string;
+  engineSize?: string;
+  haveVatReceipt?: boolean;
   projectUrl?: string;
   rebillType?: "cost" | "markup" | "price";
+  rebillFactor?: string;
   userUrl?: string;
 }): Promise<Expense> {
   resolveCategoryUrl(opts.categoryUrl);
@@ -962,6 +1190,140 @@ export async function createMileageExpense(opts: {
   const data = await faPost<{ expense: Expense }>("/expenses", body);
   const expense = data.expense;
   return { ...expense, id: extractId(expense) };
+}
+
+// ── Mileage settings ─────────────────────────────────────────────────────────
+
+/**
+ * The rate FreeAgent will actually apply to a mileage claim.
+ *
+ * The tool used to estimate the claim from MILEAGE_RATE_PENCE or the built-in
+ * HMRC bands and then report the difference after filing. FreeAgent knows the
+ * answer up front, so ask it.
+ */
+export interface MileageRate {
+  /** Pence per mile below the annual threshold. */
+  initialRatePence: number;
+  /** Pence per mile above it — equal to the initial rate when there is no band. */
+  subsequentRatePence?: number;
+  /** Miles per tax year at which the rate steps down, when there is a band. */
+  thresholdMiles?: number;
+}
+
+let cachedMileageSettings: Record<string, unknown> | null = null;
+let mileageSettingsCachedAt = 0;
+// Concurrent misses share one request: filing several journeys at once would
+// otherwise fire an identical fetch per claim.
+let mileageSettingsInFlight: Promise<Record<string, unknown>> | null = null;
+
+export function _resetMileageSettingsCache(): void {
+  cachedMileageSettings = null;
+  mileageSettingsCachedAt = 0;
+  mileageSettingsInFlight = null;
+}
+
+export async function getMileageSettings(): Promise<Record<string, unknown>> {
+  const fresh =
+    cachedMileageSettings &&
+    Date.now() - mileageSettingsCachedAt < REFERENCE_CACHE_TTL_MS;
+  if (fresh) return cachedMileageSettings as Record<string, unknown>;
+  if (mileageSettingsInFlight) return mileageSettingsInFlight;
+
+  mileageSettingsInFlight = (async () => {
+    try {
+      const data = await faGet<{ mileage_settings?: Record<string, unknown> }>(
+        "/expenses/mileage_settings"
+      );
+      cachedMileageSettings = data.mileage_settings ?? {};
+      mileageSettingsCachedAt = Date.now();
+      return cachedMileageSettings;
+    } finally {
+      // Cleared on failure too, so one bad response does not poison the next
+      // lookup with a rejected promise.
+      mileageSettingsInFlight = null;
+    }
+  })();
+  return mileageSettingsInFlight;
+}
+
+/** A rate may be quoted in pounds per mile (0.45) or pence (45). */
+function toPence(value: unknown): number | undefined {
+  const n = typeof value === "string" ? Number(value) : (value as number);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return n < 5 ? Math.round(n * 100) : Math.round(n);
+}
+
+/** Pick the entry whose from/to window contains the date. */
+function entryForDate(entries: unknown, datedOn: string): Record<string, unknown> | undefined {
+  if (!Array.isArray(entries)) return undefined;
+  const dated = entries.filter(
+    (e): e is Record<string, unknown> => Boolean(e) && typeof e === "object"
+  );
+  // No fallback to the newest entry: applying next year's rate to last year's
+  // journey is a wrong answer, and the caller's own rates are a better one.
+  return dated.find((e) => {
+    const from = typeof e["from"] === "string" ? (e["from"] as string) : undefined;
+    const to = typeof e["to"] === "string" ? (e["to"] as string) : undefined;
+    return (!from || from <= datedOn) && (!to || to >= datedOn);
+  });
+}
+
+/**
+ * The published rate for a vehicle on a date, or null when FreeAgent's answer
+ * cannot be read.
+ *
+ * The payload is a list of date-ranged settings whose inner shape has changed
+ * before now, so every lookup is defensive: anything unrecognised returns null
+ * and the caller falls back to its own configured rates rather than filing a
+ * claim against a number that was guessed from a half-understood payload.
+ */
+export async function getMileageRate(
+  datedOn: string,
+  vehicleType: VehicleType
+): Promise<MileageRate | null> {
+  let settings: Record<string, unknown>;
+  try {
+    settings = await getMileageSettings();
+  } catch {
+    return null;
+  }
+
+  const entry = entryForDate(settings["mileage_rates"], datedOn);
+  const value = entry?.["value"];
+  if (!value || typeof value !== "object") return null;
+
+  // The vehicle key is "car" / "Car" / "cars" depending on the payload version.
+  const wanted = vehicleType.toLowerCase();
+  const record = value as Record<string, unknown>;
+  const key = Object.keys(record).find((k) => k.toLowerCase().replace(/s$/, "") === wanted);
+  if (!key) return null;
+
+  const forVehicle = record[key];
+  if (typeof forVehicle === "number" || typeof forVehicle === "string") {
+    const rate = toPence(forVehicle);
+    return rate === undefined ? null : { initialRatePence: rate };
+  }
+  if (!forVehicle || typeof forVehicle !== "object") return null;
+
+  const band = forVehicle as Record<string, unknown>;
+  const initial = toPence(
+    band["initial_rate"] ?? band["initial_rate_mileage"] ?? band["rate"] ?? band["basic_rate"]
+  );
+  if (initial === undefined) return null;
+
+  const subsequent = toPence(
+    band["subsequent_rate"] ?? band["secondary_rate"] ?? band["higher_rate"]
+  );
+  const rawThreshold =
+    band["threshold"] ?? band["threshold_miles"] ?? band["initial_rate_threshold"];
+  const threshold =
+    typeof rawThreshold === "string" ? Number(rawThreshold) : (rawThreshold as number);
+
+  return {
+    initialRatePence: initial,
+    subsequentRatePence: subsequent,
+    thresholdMiles: Number.isFinite(threshold) && threshold > 0 ? threshold : undefined,
+  };
 }
 
 /** Link an expense to a bank transaction by creating a new explanation. */
@@ -983,6 +1345,92 @@ export async function linkExpenseToEntry(opts: {
   );
   const explanation = data.bank_transaction_explanation;
   return { ...explanation, id: extractId(explanation) };
+}
+
+export interface ExpenseUpdate {
+  categoryUrl?: string;
+  datedOn?: string;
+  description?: string;
+  grossValue?: string;
+  currency?: string;
+  salesTaxRate?: string;
+  manualSalesTaxAmount?: string;
+  receiptReference?: string;
+  /** "" clears the project tag. */
+  projectUrl?: string;
+  /** "" stops the expense being rebilled. */
+  rebillType?: "cost" | "markup" | "price" | "";
+  rebillFactor?: string;
+  ecStatus?: EcStatus;
+  attachment?: ExpenseAttachmentInput;
+}
+
+/**
+ * Build the PUT /v2/expenses/:id body.
+ *
+ * Only the fields the caller named are sent: a PUT that echoed every field
+ * would overwrite whatever else had been set on the expense in the meantime.
+ */
+export function buildExpenseUpdateBody(opts: ExpenseUpdate): {
+  expense: Record<string, unknown>;
+} {
+  const expense: Record<string, unknown> = {};
+
+  if (opts.categoryUrl) expense["category"] = resolveCategoryUrl(opts.categoryUrl);
+  if (opts.datedOn) expense["dated_on"] = opts.datedOn;
+  if (opts.description !== undefined) expense["description"] = opts.description;
+  if (opts.grossValue) expense["gross_value"] = toExpenseClaimValue(opts.grossValue);
+  if (opts.currency) expense["currency"] = opts.currency;
+  if (opts.salesTaxRate) expense["sales_tax_rate"] = opts.salesTaxRate;
+  if (opts.manualSalesTaxAmount) {
+    expense["manual_sales_tax_amount"] = opts.manualSalesTaxAmount;
+  }
+  if (opts.receiptReference) expense["receipt_reference"] = opts.receiptReference;
+  // An empty string clears the field: FreeAgent takes null, and without this
+  // an expense could be tagged to a project but never untagged.
+  if (opts.projectUrl !== undefined) {
+    expense["project"] = opts.projectUrl === "" ? null : resolveProjectUrl(opts.projectUrl);
+  }
+  if (opts.rebillType !== undefined) {
+    expense["rebill_type"] = opts.rebillType === "" ? null : opts.rebillType;
+  }
+  if (opts.rebillFactor) expense["rebill_factor"] = opts.rebillFactor;
+  if (opts.ecStatus) expense["ec_status"] = opts.ecStatus;
+  if (opts.attachment) {
+    expense["attachment"] = {
+      data: opts.attachment.fileBase64,
+      file_name: opts.attachment.fileName,
+      content_type: normalisePdfContentType(opts.attachment.contentType),
+      description: opts.attachment.description ?? opts.attachment.fileName,
+    };
+  }
+
+  if (Object.keys(expense).length === 0) {
+    throw new Error("Nothing to update — supply at least one field to change.");
+  }
+
+  return { expense };
+}
+
+export async function updateExpense(
+  expenseId: string,
+  opts: ExpenseUpdate
+): Promise<Expense> {
+  const id = assertNumericId(expenseId, "expense");
+  const body = buildExpenseUpdateBody(opts);
+  const data = await faPut<{ expense: Expense }>(`/expenses/${id}`, body);
+  const expense = data.expense;
+  return { ...expense, id: extractId(expense) };
+}
+
+export async function deleteExpense(expenseId: string): Promise<void> {
+  await faDelete(`/expenses/${assertNumericId(expenseId, "expense")}`);
+}
+
+export async function getExpense(expenseId: string): Promise<Expense> {
+  const id = assertNumericId(expenseId, "expense");
+  const data = await faGet<{ expense: Expense }>(`/expenses/${id}`);
+  return { ...data.expense, id: extractId(data.expense) };
 }
 
 // ── Contacts ─────────────────────────────────────────────────────────────────
@@ -1016,6 +1464,11 @@ export interface ContactInput {
   country?: string;
   contactNameOnInvoices?: boolean;
   chargeSalesTax?: "Auto" | "Always" | "Never";
+  salesTaxRegistrationNumber?: string;
+  defaultPaymentTermsInDays?: number;
+  status?: "Active" | "Hidden";
+  /** Internal: on update, an empty string clears the field instead of being dropped. */
+  clearEmpty?: boolean;
 }
 
 export function buildContactBody(opts: ContactInput): { contact: Record<string, unknown> } {
@@ -1038,9 +1491,23 @@ export function buildContactBody(opts: ContactInput): { contact: Record<string, 
     ["postcode", opts.postcode],
     ["country", opts.country],
     ["charge_sales_tax", opts.chargeSalesTax],
+    // Without the client's VAT number a reverse-charge invoice is not a valid
+    // one — FreeAgent prints it on the invoice, and the EC Sales List needs it.
+    ["sales_tax_registration_number", opts.salesTaxRegistrationNumber],
+    ["default_payment_terms_in_days", opts.defaultPaymentTermsInDays],
+    ["status", opts.status],
   ];
+  // `clearEmpty` steers the loop below; it is not a FreeAgent attribute.
   for (const [key, value] of map) {
-    if (value !== undefined && value !== "") contact[key] = value;
+    if (value === undefined) continue;
+    // On create a blank is noise, so it is dropped. On update it means
+    // "clear this" — see buildContactUpdateBody, which maps it to null.
+    if (value === "") {
+      if (!opts.clearEmpty) continue;
+      contact[key] = null;
+      continue;
+    }
+    contact[key] = value;
   }
   // Show the organisation on invoices unless the caller says otherwise.
   if (opts.contactNameOnInvoices !== undefined) {
@@ -1052,6 +1519,51 @@ export function buildContactBody(opts: ContactInput): { contact: Record<string, 
 export async function createContact(opts: ContactInput): Promise<Contact> {
   const data = await faPost<{ contact: Contact }>("/contacts", buildContactBody(opts));
   return { ...data.contact, id: extractId(data.contact) };
+}
+
+/**
+ * Build the PUT /v2/contacts/:id body.
+ *
+ * Unlike create, an update needs no name: renaming is one of the things it is
+ * for, and the existing name stands when none is given. Only named fields are
+ * sent so a PUT cannot blank out a field the caller never mentioned.
+ */
+export function buildContactUpdateBody(opts: ContactInput): {
+  contact: Record<string, unknown>;
+} {
+  const { contact } = buildContactBody({
+    ...opts,
+    clearEmpty: true,
+    // Satisfy the create-time name rule without sending a name of our own.
+    organisationName: opts.organisationName ?? "-",
+  });
+  if (!opts.organisationName) delete contact["organisation_name"];
+  if (Object.keys(contact).length === 0) {
+    throw new Error("Nothing to update — supply at least one field to change.");
+  }
+  return { contact };
+}
+
+export async function updateContact(
+  contactId: string,
+  opts: ContactInput
+): Promise<Contact> {
+  const id = assertNumericId(contactId, "contact");
+  const data = await faPut<{ contact: Contact }>(
+    `/contacts/${id}`,
+    buildContactUpdateBody(opts)
+  );
+  return { ...data.contact, id: extractId(data.contact) };
+}
+
+export async function getContact(contactId: string): Promise<Contact> {
+  const id = assertNumericId(contactId, "contact");
+  const data = await faGet<{ contact: Contact }>(`/contacts/${id}`);
+  return { ...data.contact, id: extractId(data.contact) };
+}
+
+export async function deleteContact(contactId: string): Promise<void> {
+  await faDelete(`/contacts/${assertNumericId(contactId, "contact")}`);
 }
 
 // ── Invoices ─────────────────────────────────────────────────────────────────
@@ -1095,12 +1607,18 @@ export async function getInvoice(invoiceId: string): Promise<Invoice> {
   return { ...data.invoice, id: extractId(data.invoice) };
 }
 
+/**
+ * Invoices add EC VAT MOSS to the four statuses a purchase can carry.
+ */
+export type InvoiceEcStatus = EcStatus | "EC VAT MOSS";
+
 export interface InvoiceItemInput {
   description: string;
   itemType: string;
   price: string;
   quantity: string;
   salesTaxRate?: string;
+  salesTaxStatus?: "TAXABLE" | "EXEMPT";
   categoryUrl?: string;
 }
 
@@ -1115,6 +1633,8 @@ export interface InvoiceInput {
   poReference?: string;
   comments?: string;
   discountPercent?: string;
+  ecStatus?: InvoiceEcStatus;
+  placeOfSupply?: string;
 }
 
 export function buildInvoiceBody(opts: InvoiceInput): { invoice: Record<string, unknown> } {
@@ -1124,6 +1644,11 @@ export function buildInvoiceBody(opts: InvoiceInput): { invoice: Record<string, 
   if (!Number.isInteger(opts.paymentTermsInDays) || opts.paymentTermsInDays < 0) {
     throw new Error(
       `Invalid payment terms "${opts.paymentTermsInDays}". Expected a whole number of days.`
+    );
+  }
+  if (opts.ecStatus === "EC VAT MOSS" && !opts.placeOfSupply) {
+    throw new Error(
+      "EC VAT MOSS invoices need a placeOfSupply — the country whose VAT rate applies."
     );
   }
 
@@ -1142,6 +1667,7 @@ export function buildInvoiceBody(opts: InvoiceInput): { invoice: Record<string, 
         quantity: item.quantity,
       };
       if (item.salesTaxRate !== undefined) line["sales_tax_rate"] = item.salesTaxRate;
+      if (item.salesTaxStatus) line["sales_tax_status"] = item.salesTaxStatus;
       if (item.categoryUrl) line["category"] = resolveCategoryUrl(item.categoryUrl);
       return line;
     }),
@@ -1153,6 +1679,10 @@ export function buildInvoiceBody(opts: InvoiceInput): { invoice: Record<string, 
   if (opts.poReference) invoice["po_reference"] = opts.poReference;
   if (opts.comments) invoice["comments"] = opts.comments;
   if (opts.discountPercent) invoice["discount_percent"] = opts.discountPercent;
+  // Left unset, FreeAgent raises the invoice as UK/Non-EC — so a sale to an
+  // overseas client lands on the VAT return under the wrong box.
+  if (opts.ecStatus) invoice["ec_status"] = opts.ecStatus;
+  if (opts.placeOfSupply) invoice["place_of_supply"] = opts.placeOfSupply;
 
   return { invoice };
 }
@@ -1172,6 +1702,112 @@ export type InvoiceTransition =
  * Move an invoice between states. These are status changes only — none of
  * them emails the client.
  */
+export interface InvoiceUpdate {
+  contactUrl?: string;
+  datedOn?: string;
+  paymentTermsInDays?: number;
+  reference?: string;
+  currency?: string;
+  projectUrl?: string;
+  poReference?: string;
+  comments?: string;
+  discountPercent?: string;
+  ecStatus?: InvoiceEcStatus;
+  placeOfSupply?: string;
+  items?: Array<Partial<InvoiceItemInput> & { itemUrl?: string; destroy?: boolean }>;
+}
+
+/**
+ * Build the PUT /v2/invoices/:id body.
+ *
+ * Line items are addressed by their own URL: one without a url is added, one
+ * with a url is edited, and `destroy` removes it. Omitting invoice_items
+ * entirely leaves the existing lines untouched — sending a fresh array without
+ * urls would append duplicates rather than replace anything.
+ */
+export function buildInvoiceUpdateBody(opts: InvoiceUpdate): {
+  invoice: Record<string, unknown>;
+} {
+  if (opts.ecStatus === "EC VAT MOSS" && !opts.placeOfSupply) {
+    throw new Error(
+      "EC VAT MOSS invoices need a placeOfSupply — the country whose VAT rate applies."
+    );
+  }
+  if (
+    opts.paymentTermsInDays !== undefined &&
+    (!Number.isInteger(opts.paymentTermsInDays) || opts.paymentTermsInDays < 0)
+  ) {
+    throw new Error(
+      `Invalid payment terms "${opts.paymentTermsInDays}". Expected a whole number of days.`
+    );
+  }
+
+  const invoice: Record<string, unknown> = {};
+  if (opts.contactUrl) invoice["contact"] = resolveContactUrl(opts.contactUrl);
+  if (opts.datedOn) invoice["dated_on"] = opts.datedOn;
+  if (opts.paymentTermsInDays !== undefined) {
+    invoice["payment_terms_in_days"] = opts.paymentTermsInDays;
+  }
+  if (opts.reference) invoice["reference"] = opts.reference;
+  if (opts.currency) invoice["currency"] = opts.currency;
+  if (opts.projectUrl) invoice["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.poReference !== undefined) invoice["po_reference"] = opts.poReference;
+  if (opts.comments !== undefined) invoice["comments"] = opts.comments;
+  if (opts.discountPercent) invoice["discount_percent"] = opts.discountPercent;
+  if (opts.ecStatus) invoice["ec_status"] = opts.ecStatus;
+  if (opts.placeOfSupply) invoice["place_of_supply"] = opts.placeOfSupply;
+
+  if (opts.items?.length) {
+    invoice["invoice_items"] = opts.items.map((item, index) => {
+      const line: Record<string, unknown> = {};
+      if (item.itemUrl) line["url"] = resolveInvoiceItemUrl(item.itemUrl);
+      if (item.destroy) {
+        if (!item.itemUrl) {
+          throw new Error(
+            `Line ${index + 1} asks to be removed but has no itemUrl — read it from freeagent_get_invoice.`
+          );
+        }
+        line["_destroy"] = 1;
+        return line;
+      }
+      if (item.price !== undefined) {
+        // Reject a malformed price outright — "750.00x" must not become 750.
+        toMinorUnits(item.price, `price on line ${index + 1}`);
+        line["price"] = item.price;
+      }
+      if (item.description !== undefined) line["description"] = item.description;
+      if (item.itemType !== undefined) line["item_type"] = item.itemType;
+      if (item.quantity !== undefined) line["quantity"] = item.quantity;
+      if (item.salesTaxRate !== undefined) line["sales_tax_rate"] = item.salesTaxRate;
+      if (item.salesTaxStatus) line["sales_tax_status"] = item.salesTaxStatus;
+      if (item.categoryUrl) line["category"] = resolveCategoryUrl(item.categoryUrl);
+      if (!item.itemUrl && (item.description === undefined || item.price === undefined)) {
+        throw new Error(
+          `Line ${index + 1} is new, so it needs both description and price.`
+        );
+      }
+      return line;
+    });
+  }
+
+  if (Object.keys(invoice).length === 0) {
+    throw new Error("Nothing to update — supply at least one field to change.");
+  }
+  return { invoice };
+}
+
+export async function updateInvoice(
+  invoiceId: string,
+  opts: InvoiceUpdate
+): Promise<Invoice> {
+  const id = assertNumericId(invoiceId, "invoice");
+  const data = await faPut<{ invoice: Invoice }>(
+    `/invoices/${id}`,
+    buildInvoiceUpdateBody(opts)
+  );
+  return { ...data.invoice, id: extractId(data.invoice) };
+}
+
 export async function transitionInvoice(
   invoiceId: string,
   transition: InvoiceTransition
@@ -1221,6 +1857,9 @@ export interface BillItemInput {
   totalValue: string;
   description?: string;
   salesTaxRate?: string;
+  salesTaxStatus?: "TAXABLE" | "EXEMPT" | "OUT_OF_SCOPE";
+  quantity?: string;
+  unit?: string;
 }
 
 export interface BillInput {
@@ -1233,6 +1872,8 @@ export interface BillInput {
   projectUrl?: string;
   rebillType?: "cost" | "markup" | "price";
   rebillFactor?: string;
+  ecStatus?: EcStatus;
+  comments?: string;
   attachment?: ExpenseAttachmentInput;
 }
 
@@ -1264,6 +1905,9 @@ export function buildBillBody(opts: BillInput): { bill: Record<string, unknown> 
       };
       if (item.description) line["description"] = item.description;
       if (item.salesTaxRate !== undefined) line["sales_tax_rate"] = item.salesTaxRate;
+      if (item.salesTaxStatus) line["sales_tax_status"] = item.salesTaxStatus;
+      if (item.quantity !== undefined) line["quantity"] = item.quantity;
+      if (item.unit) line["unit"] = item.unit;
       return line;
     }),
   };
@@ -1272,6 +1916,10 @@ export function buildBillBody(opts: BillInput): { bill: Record<string, unknown> 
   if (opts.projectUrl) bill["project"] = resolveProjectUrl(opts.projectUrl);
   if (opts.rebillType) bill["rebill_type"] = opts.rebillType;
   if (opts.rebillFactor) bill["rebill_factor"] = opts.rebillFactor;
+  // Same default as expenses: unset means UK/Non-EC, which is wrong for an
+  // overseas supplier and for anything under the reverse charge.
+  if (opts.ecStatus) bill["ec_status"] = opts.ecStatus;
+  if (opts.comments) bill["comments"] = opts.comments;
   if (opts.attachment) {
     bill["attachment"] = {
       data: opts.attachment.fileBase64,
@@ -1286,6 +1934,98 @@ export function buildBillBody(opts: BillInput): { bill: Record<string, unknown> 
 
 export async function createBill(opts: BillInput): Promise<Bill> {
   const data = await faPost<{ bill: Bill }>("/bills", buildBillBody(opts));
+  return { ...data.bill, id: extractId(data.bill) };
+}
+
+export async function getBill(billId: string): Promise<Bill> {
+  const id = assertNumericId(billId, "bill");
+  const data = await faGet<{ bill: Bill }>(`/bills/${id}`);
+  return { ...data.bill, id: extractId(data.bill) };
+}
+
+export interface BillUpdate {
+  contactUrl?: string;
+  reference?: string;
+  datedOn?: string;
+  dueOn?: string;
+  currency?: string;
+  projectUrl?: string;
+  rebillType?: "cost" | "markup" | "price";
+  rebillFactor?: string;
+  ecStatus?: EcStatus;
+  comments?: string;
+  items?: Array<Partial<BillItemInput> & { itemUrl?: string; destroy?: boolean }>;
+}
+
+/**
+ * Build the PUT /v2/bills/:id body.
+ *
+ * Line items follow FreeAgent's own convention: a line with no url is added,
+ * one carrying its url is edited, and `destroy` removes it. Omit items
+ * entirely to leave the existing lines alone.
+ */
+export function buildBillUpdateBody(opts: BillUpdate): { bill: Record<string, unknown> } {
+  const bill: Record<string, unknown> = {};
+  if (opts.contactUrl) bill["contact"] = resolveContactUrl(opts.contactUrl);
+  if (opts.reference) bill["reference"] = opts.reference;
+  if (opts.datedOn) bill["dated_on"] = opts.datedOn;
+  if (opts.dueOn) bill["due_on"] = opts.dueOn;
+  if (opts.currency) bill["currency"] = opts.currency;
+  if (opts.projectUrl) bill["project"] = resolveProjectUrl(opts.projectUrl);
+  if (opts.rebillType) bill["rebill_type"] = opts.rebillType;
+  if (opts.rebillFactor) bill["rebill_factor"] = opts.rebillFactor;
+  if (opts.ecStatus) bill["ec_status"] = opts.ecStatus;
+  if (opts.comments !== undefined) bill["comments"] = opts.comments;
+
+  if (opts.items?.length) {
+    if (opts.items.length > 40) {
+      throw new Error(`A bill accepts at most 40 line items (got ${opts.items.length}).`);
+    }
+    bill["bill_items"] = opts.items.map((item, index) => {
+      const line: Record<string, unknown> = {};
+      if (item.itemUrl) line["url"] = resolveBillItemUrl(item.itemUrl);
+      if (item.destroy) {
+        if (!item.itemUrl) {
+          throw new Error(
+            `Line ${index + 1} asks to be removed but has no itemUrl — read it from freeagent_get_bill.`
+          );
+        }
+        line["_destroy"] = 1;
+        return line;
+      }
+      if (item.categoryUrl) line["category"] = resolveCategoryUrl(item.categoryUrl);
+      if (item.totalValue !== undefined) {
+        const minor = toMinorUnits(item.totalValue, "bill line value");
+        if (minor <= 0) {
+          throw new Error(
+            `Invalid bill line value "${item.totalValue}". A bill line must be greater than zero.`
+          );
+        }
+        line["total_value"] = item.totalValue;
+      }
+      if (item.description !== undefined) line["description"] = item.description;
+      if (item.salesTaxRate !== undefined) line["sales_tax_rate"] = item.salesTaxRate;
+      if (item.salesTaxStatus) line["sales_tax_status"] = item.salesTaxStatus;
+      if (item.quantity !== undefined) line["quantity"] = item.quantity;
+      if (item.unit) line["unit"] = item.unit;
+      if (!item.itemUrl && (!item.categoryUrl || item.totalValue === undefined)) {
+        throw new Error(
+          `Line ${index + 1} is new, so it needs both categoryUrl and totalValue.`
+        );
+      }
+      return line;
+    });
+  }
+
+  if (Object.keys(bill).length === 0) {
+    throw new Error("Nothing to update — supply at least one field to change.");
+  }
+  return { bill };
+}
+
+export async function updateBill(billId: string, opts: BillUpdate): Promise<Bill> {
+  const id = assertNumericId(billId, "bill");
+  const data = await faPut<{ bill: Bill }>(`/bills/${id}`, buildBillUpdateBody(opts));
   return { ...data.bill, id: extractId(data.bill) };
 }
 
@@ -1338,6 +2078,39 @@ export function buildTaskBody(opts: TaskInput): { task: Record<string, unknown> 
 export async function createTask(opts: TaskInput): Promise<Task> {
   const data = await faPost<{ task: Task }>("/tasks", buildTaskBody(opts));
   return { ...data.task, id: extractId(data.task) };
+}
+
+/**
+ * Build the PUT /v2/tasks/:id body. The project cannot move, so it is not
+ * accepted here — only the task's own attributes.
+ */
+export function buildTaskUpdateBody(
+  opts: Omit<Partial<TaskInput>, "projectUrl">
+): { task: Record<string, unknown> } {
+  const task: Record<string, unknown> = {};
+  if (opts.name) task["name"] = opts.name;
+  if (opts.isBillable !== undefined) task["is_billable"] = opts.isBillable;
+  if (opts.billingRate !== undefined) task["billing_rate"] = opts.billingRate;
+  if (opts.billingPeriod) task["billing_period"] = opts.billingPeriod;
+  if (opts.currency) task["currency"] = opts.currency;
+  if (opts.status) task["status"] = opts.status;
+  if (Object.keys(task).length === 0) {
+    throw new Error("Nothing to update — supply at least one field to change.");
+  }
+  return { task };
+}
+
+export async function updateTask(
+  taskId: string,
+  opts: Omit<Partial<TaskInput>, "projectUrl">
+): Promise<Task> {
+  const id = assertNumericId(taskId, "task");
+  const data = await faPut<{ task: Task }>(`/tasks/${id}`, buildTaskUpdateBody(opts));
+  return { ...data.task, id: extractId(data.task) };
+}
+
+export async function deleteTask(taskId: string): Promise<void> {
+  await faDelete(`/tasks/${assertNumericId(taskId, "task")}`);
 }
 
 // ── Timeslips ────────────────────────────────────────────────────────────────
@@ -1408,6 +2181,42 @@ export async function createTimeslip(opts: {
   // FreeAgent may answer with either the singular or the plural form.
   const timeslip = data.timeslip ?? data.timeslips?.[0];
   if (!timeslip) throw new Error("FreeAgent did not return the created timeslip.");
+  return { ...timeslip, id: extractId(timeslip) };
+}
+
+export function buildTimeslipUpdateBody(opts: {
+  taskUrl?: string;
+  datedOn?: string;
+  hours?: string;
+  comment?: string;
+}): { timeslip: Record<string, unknown> } {
+  const timeslip: Record<string, unknown> = {};
+  if (opts.taskUrl) timeslip["task"] = resolveTaskUrl(opts.taskUrl);
+  if (opts.datedOn) timeslip["dated_on"] = opts.datedOn;
+  if (opts.hours !== undefined) {
+    if (!/^\d+(\.\d+)?$/.test(String(opts.hours).trim()) || Number(opts.hours) <= 0) {
+      throw new Error(`Invalid hours "${opts.hours}". Expected a positive number like "1.5".`);
+    }
+    timeslip["hours"] = opts.hours;
+  }
+  if (opts.comment !== undefined) timeslip["comment"] = opts.comment;
+  if (Object.keys(timeslip).length === 0) {
+    throw new Error("Nothing to update — supply at least one field to change.");
+  }
+  return { timeslip };
+}
+
+export async function updateTimeslip(
+  timeslipId: string,
+  opts: { taskUrl?: string; datedOn?: string; hours?: string; comment?: string }
+): Promise<Timeslip> {
+  const id = assertNumericId(timeslipId, "timeslip");
+  const data = await faPut<{ timeslip?: Timeslip; timeslips?: Timeslip[] }>(
+    `/timeslips/${id}`,
+    buildTimeslipUpdateBody(opts)
+  );
+  const timeslip = data.timeslip ?? data.timeslips?.[0];
+  if (!timeslip) throw new Error("FreeAgent did not return the updated timeslip.");
   return { ...timeslip, id: extractId(timeslip) };
 }
 

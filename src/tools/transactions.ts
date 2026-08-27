@@ -1,16 +1,16 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFile } from "node:fs/promises";
-import { basename } from "node:path";
 import {
   listBankTransactions,
   updateExplanation,
   uploadAttachment,
   deleteExistingAttachment,
-  fetchUrlAsBase64,
   handleFAError,
 } from "../services/freeagent.js";
-import { inferContentType } from "../utils/contentType.js";
+import {
+  checkAttachmentSource,
+  resolveAttachmentSource,
+} from "../utils/attachmentSource.js";
 import { dateSchema, invalid } from "./respond.js";
 
 // Max ~7.5 MB binary when decoded
@@ -172,46 +172,26 @@ export function registerTransactionTools(server: McpServer): void {
       // no parameters and send none. Cross-field rules belong in the handler.
     async (args) => {
       try {
-        const sources = [args.fileBase64, args.filePath, args.fileUrl].filter(Boolean);
-        if (sources.length > 1) {
-          return invalid("Supply at most one of fileBase64, filePath or fileUrl.");
-        }
-        if (args.fileBase64 && !args.fileName) {
-          return invalid("fileBase64 requires fileName.");
-        }
+        const badSource = checkAttachmentSource(args);
+        if (badSource) return invalid(badSource);
 
         const actions: string[] = [];
 
         // 1. Attach file if provided — resolve bytes from filePath / fileUrl / fileBase64.
         let attachmentUrl: string | undefined;
-        let fileBase64 = args.fileBase64;
-        let fileName = args.fileName;
-        let contentType = args.contentType;
-        if (!fileBase64 && args.filePath) {
-          const buf = await readFile(args.filePath);
-          fileBase64 = buf.toString("base64");
-          fileName = fileName ?? basename(args.filePath);
-        }
-        if (!fileBase64 && args.fileUrl) {
-          const fetched = await fetchUrlAsBase64(args.fileUrl);
-          fileBase64 = fetched.base64;
-          fileName = fileName ?? fetched.fileName ?? "attachment.pdf";
-          contentType = contentType ?? fetched.contentType;
-        }
-        if (fileBase64) {
-          if (fileBase64.length > FILE_BASE64_MAX) {
-            throw new Error("File too large to attach (over ~7.5 MB).");
-          }
-          const name = fileName ?? "attachment.pdf";
-          const ct = contentType ?? inferContentType(name);
+        const attachment = await resolveAttachmentSource(args, {
+          maxBase64: FILE_BASE64_MAX,
+          sizeLabel: "~7.5 MB",
+        });
+        if (attachment) {
           // FreeAgent won't overwrite an existing attachment via PUT — remove it first.
           const replaced = await deleteExistingAttachment(args.explanationId).catch(() => false);
           const att = await uploadAttachment({
             entityId: args.explanationId,
             entityType: "bank_transaction_explanation",
-            fileName: name,
-            contentType: ct,
-            fileBase64,
+            fileName: attachment.fileName,
+            contentType: attachment.contentType,
+            fileBase64: attachment.fileBase64,
           });
           attachmentUrl = att.url;
           actions.push(

@@ -7,8 +7,8 @@
  *  - Explain transactions (categorise, describe, attach receipt, approve)
  *  - Create expenses from receipts (personal card / cash claims)
  *  - Create mileage expenses
- *  - List expense categories and projects
- *  - Manage contacts (clients and suppliers)
+ *  - List expense categories; create and manage projects
+ *  - Manage contacts (clients and suppliers) and projects
  *  - Raise, issue and track invoices; chase overdue payers
  *  - Record supplier bills (accounts payable)
  *  - Log time against project tasks
@@ -26,7 +26,8 @@
  *
  * Optional:
  *   VENDOR_CATEGORIES         – JSON: vendor name → FreeAgent category URL
- *   MILEAGE_RATE_PENCE        – Flat pence-per-mile rate (overrides HMRC rates)
+ *   MILEAGE_RATE_PENCE        – Fallback pence-per-mile rate, used only when
+ *                               FreeAgent's own mileage settings cannot be read
  *   MILEAGE_CATEGORY_URL      – FreeAgent category URL for mileage
  *   HMRC_RATE_HIGH_PENCE      – HMRC high rate in pence (default 45)
  *   HMRC_RATE_LOW_PENCE       – HMRC low rate in pence (default 25)
@@ -34,6 +35,8 @@
  *   ORS_API_KEY               – OpenRouteService key (mileage distance calc)
  *   GOOGLE_MAPS_API_KEY       – Google Maps key (alternative to ORS)
  *   PORT                      – HTTP mode port (e.g. 3000)
+ *   FREEAGENT_ATTACHMENT_ROOTS – Colon-separated dirs that filePath attachments
+ *                               may be read from (required in HTTP mode)
  *   AUTH_TOKEN                – Bearer token required in HTTP mode (recommended)
  */
 
@@ -44,6 +47,7 @@ import { registerAccountTools } from "./tools/accounts.js";
 import { registerTransactionTools } from "./tools/transactions.js";
 import { registerExpenseTools } from "./tools/expenses.js";
 import { registerMileageTools } from "./tools/mileage.js";
+import { registerProjectTools } from "./tools/projects.js";
 import { registerContactTools } from "./tools/contacts.js";
 import { registerInvoiceTools } from "./tools/invoices.js";
 import { registerBillTools } from "./tools/bills.js";
@@ -85,6 +89,15 @@ When a task involves attaching a receipt or invoice to a transaction or expense,
 
 Only ask the user to provide a file if none of these sources yield a match.
 
+**Pass the file by reference, not by value.** Every attaching tool takes \`filePath\` (an absolute path the server reads itself) and \`fileUrl\` (a link the server downloads). Use those. \`fileBase64\` is a last resort: anything beyond a few hundred KB is unreliable inline and the record ends up with no receipt at all.
+
+An expense, bill or explanation that was filed without a receipt can be fixed afterwards — \`freeagent_update_expense\`, \`freeagent_update_bill\` and \`freeagent_explain_transaction\` all attach to an existing record and replace whatever is already there.
+
+## Rebilling and VAT — two things that fail silently
+
+- Tagging an expense or bill to a **project** attributes the cost to it but does NOT queue it to bill on. Pass \`rebillType\` (\`cost\`, \`markup\` or \`price\`) as well whenever the user says a cost is being passed on to a client.
+- \`ecStatus\` defaults to \`UK/Non-EC\` on every expense, bill and invoice. For an overseas supplier or client, or anything under the reverse charge, set it explicitly — otherwise the item lands in the wrong box on the VAT return and nothing warns you.
+
 ## Reconciliation workflow
 
 When asked to reconcile transactions or "process" unexplained items:
@@ -120,6 +133,8 @@ Time is logged against a project TASK, never a project directly. Use \`freeagent
 Never set \`markExplained: true\` without a confirmed receipt or explicit user instruction. Transactions skipped due to missing receipts should be reported to the user for manual follow-up.
 
 Confirm with the user before issuing an invoice (\`mark_as_sent\`), deleting anything, or recording a bill — these affect the company's real financial records.
+
+Deleting is permanent and FreeAgent keeps no copy. \`freeagent_delete_expense\`, \`freeagent_delete_contact\` and \`freeagent_delete_project\` each require \`confirm: true\` on top of the user's say-so. Prefer correcting over deleting: \`freeagent_update_expense\` fixes a wrong expense, and setting \`status\` to \`Hidden\` or \`Completed\` retires a contact, project or task that has history behind it.
     `.trim(),
   }
 );
@@ -128,6 +143,7 @@ registerAccountTools(server);
 registerTransactionTools(server);
 registerExpenseTools(server);
 registerMileageTools(server);
+registerProjectTools(server);
 registerContactTools(server);
 registerInvoiceTools(server);
 registerBillTools(server);

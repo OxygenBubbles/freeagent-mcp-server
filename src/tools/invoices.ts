@@ -2,13 +2,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   listInvoices,
+  updateInvoice,
   getInvoice,
   createInvoice,
   transitionInvoice,
   deleteInvoice,
 } from "../services/freeagent.js";
 import { sumResponseMoney } from "../utils/money.js";
-import { ok, fail, resourceRegex, dateSchema } from "./respond.js";
+import { ok, fail, invalid, resourceRegex, dateSchema } from "./respond.js";
 
 const CONTACT_REF = resourceRegex("contacts");
 const PROJECT_REF = resourceRegex("projects");
@@ -150,6 +151,9 @@ export function registerInvoiceTools(server: McpServer): void {
           po_reference: invoice.po_reference ?? null,
           comments: invoice.comments ?? null,
           items: (invoice.invoice_items ?? []).map((it) => ({
+            // The line's own URL is what freeagent_update_invoice needs to
+            // edit or remove it — without it, existing lines are unaddressable.
+            itemUrl: it.url ?? null,
             description: it.description,
             item_type: it.item_type,
             price: it.price,
@@ -208,6 +212,10 @@ export function registerInvoiceTools(server: McpServer): void {
                   .regex(/^-?\d+(\.\d+)?$/, "Numeric string, e.g. '1.0'")
                   .default("1.0")
                   .describe("Quantity (e.g. '1.0', or hours/days for time-based types)"),
+                salesTaxStatus: z
+                  .enum(["TAXABLE", "EXEMPT"])
+                  .optional()
+                  .describe("Whether this line is taxable or exempt (default: TAXABLE)"),
                 salesTaxRate: z
                   .string()
                   .regex(/^\d+(\.\d+)?$/, "Percentage, e.g. '20.0'")
@@ -235,6 +243,18 @@ export function registerInvoiceTools(server: McpServer): void {
             .regex(PROJECT_REF, "Must be a project path like /v2/projects/123")
             .optional()
             .describe("Project this invoice belongs to"),
+          ecStatus: z
+            .enum(["UK/Non-EC", "EC Goods", "EC Services", "Reverse Charge", "EC VAT MOSS"])
+            .optional()
+            .describe(
+              "VAT treatment for the sale. Defaults to 'UK/Non-EC' — set it for an overseas client " +
+              "or a reverse-charge sale, or the VAT return reports it in the wrong box."
+            ),
+          placeOfSupply: z
+            .string()
+            .max(100)
+            .optional()
+            .describe("Country whose VAT rate applies — required when ecStatus is 'EC VAT MOSS'"),
           poReference: z.string().max(100).optional().describe("Client purchase order reference"),
           comments: z.string().max(2000).optional().describe("Notes shown on the invoice"),
           discountPercent: z
@@ -261,6 +281,8 @@ export function registerInvoiceTools(server: McpServer): void {
           reference: args.reference,
           currency: args.currency,
           projectUrl: args.project,
+          ecStatus: args.ecStatus,
+          placeOfSupply: args.placeOfSupply,
           poReference: args.poReference,
           comments: args.comments,
           discountPercent: args.discountPercent,
@@ -277,6 +299,158 @@ export function registerInvoiceTools(server: McpServer): void {
           sales_tax_value: invoice.sales_tax_value ?? null,
           total_value: invoice.total_value,
           note: "Created as a draft. It has not been sent to the client.",
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  // ── Update ──────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "freeagent_update_invoice",
+    {
+      description:
+        "Edit a FreeAgent invoice — change its dates, reference, project, VAT status, discount or comments, " +
+        "and add, edit or remove line items.\n\n" +
+        "Only the fields you pass are changed. Line items are addressed by their own URL: a line with no " +
+        "itemUrl is ADDED, a line with itemUrl is edited, and destroy=true removes it. Omit items entirely " +
+        "to leave the existing lines alone — read them from freeagent_get_invoice first.\n\n" +
+        "FreeAgent only allows edits to a draft invoice: pull an issued one back with " +
+        "freeagent_update_invoice_status mark_as_draft before editing it.",
+      inputSchema: z
+        .object({
+          invoiceId: z
+            .string()
+            .regex(/^\d+$/, "Numeric invoice ID")
+            .describe("FreeAgent invoice ID"),
+          contact: z
+            .string()
+            .regex(CONTACT_REF, "Must be a contact path like /v2/contacts/123")
+            .optional()
+            .describe("Move the invoice to a different client"),
+          datedOn: dateSchema("Invoice date YYYY-MM-DD").optional(),
+          paymentTermsInDays: z
+            .number()
+            .int()
+            .min(0)
+            .max(365)
+            .optional()
+            .describe("Payment terms in days (0 = due on receipt)"),
+          reference: z.string().max(100).optional().describe("Invoice reference"),
+          currency: z
+            .string()
+            .regex(/^[A-Z]{3}$/, "Three-letter uppercase ISO 4217 code, e.g. GBP")
+            .optional()
+            .describe("ISO 4217 currency"),
+          project: z
+            .string()
+            .regex(PROJECT_REF, "Must be a project path like /v2/projects/123")
+            .optional()
+            .describe("Project this invoice belongs to"),
+          poReference: z.string().max(100).optional().describe("Client purchase order reference"),
+          comments: z.string().max(2000).optional().describe("Notes shown on the invoice"),
+          discountPercent: z
+            .string()
+            .regex(/^\d+(\.\d+)?$/, "Percentage, e.g. '10.0'")
+            .optional()
+            .describe("Discount across the whole invoice"),
+          ecStatus: z
+            .enum(["UK/Non-EC", "EC Goods", "EC Services", "Reverse Charge", "EC VAT MOSS"])
+            .optional()
+            .describe("VAT treatment for the sale"),
+          placeOfSupply: z
+            .string()
+            .max(100)
+            .optional()
+            .describe("Country whose VAT rate applies — required when ecStatus is 'EC VAT MOSS'"),
+          items: z
+            .array(
+              z.object({
+                itemUrl: z
+                  .string()
+                  .regex(
+                    /^(?:https:\/\/api\.freeagent\.com)?\/v2\/invoice_items\/\d+$/,
+                    "Must be an invoice item path like /v2/invoice_items/123"
+                  )
+                  .optional()
+                  .describe("URL of an existing line to edit or remove. Omit to add a new line."),
+                destroy: z
+                  .boolean()
+                  .optional()
+                  .describe("Set true with itemUrl to delete that line"),
+                description: z.string().max(2000).optional().describe("Line description"),
+                itemType: z.enum(ITEM_TYPES).optional().describe("Unit the line is measured in"),
+                price: z
+                  .string()
+                  .regex(/^-?\d+(\.\d{1,2})?$/, "Decimal amount, e.g. '750.00'")
+                  .optional()
+                  .describe("Unit price"),
+                quantity: z
+                  .string()
+                  .regex(/^\d+(\.\d+)?$/, "Positive number, e.g. '4.0'")
+                  .optional()
+                  .describe("Quantity"),
+                salesTaxRate: z
+                  .string()
+                  .regex(/^\d+(\.\d+)?$/, "Percentage, e.g. '20.0'")
+                  .optional()
+                  .describe("VAT rate (e.g. '20.0')"),
+                salesTaxStatus: z
+                  .enum(["TAXABLE", "EXEMPT"])
+                  .optional()
+                  .describe("Whether this line is taxable or exempt"),
+                categoryUrl: z
+                  .string()
+                  .regex(CATEGORY_REF, "Must be a category path like /v2/categories/001")
+                  .optional()
+                  .describe("Income category for the line"),
+              })
+            )
+            .max(40)
+            .optional()
+            .describe("Line items to add, edit or remove — see the description for the rules"),
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+    },
+      // NOTE: this check is NOT a schema-level .refine(). Calling .refine() on
+      // the object turns it into a ZodEffects, which the MCP SDK cannot read a
+      // .shape from — it then advertises an EMPTY inputSchema, so clients see
+      // no parameters and send none. Cross-field rules belong in the handler.
+    async (args) => {
+      try {
+        const { invoiceId, contact, project, ...rest } = args;
+        const named = Object.entries(rest).filter(([, v]) => v !== undefined);
+        if (named.length === 0 && !contact && !project) {
+          return invalid("Nothing to update — supply at least one field to change.");
+        }
+
+        const invoice = await updateInvoice(invoiceId, {
+          ...rest,
+          ...(contact ? { contactUrl: contact } : {}),
+          ...(project ? { projectUrl: project } : {}),
+        });
+
+        return ok({
+          success: true,
+          invoiceId: invoice.id,
+          invoiceUrl: invoice.url,
+          reference: invoice.reference ?? null,
+          status: invoice.status,
+          dated_on: invoice.dated_on,
+          due_on: invoice.due_on ?? null,
+          net_value: invoice.net_value,
+          sales_tax_value: invoice.sales_tax_value ?? null,
+          total_value: invoice.total_value,
+          changed: named
+            .map(([k]) => k)
+            .concat(contact ? ["contact"] : [], project ? ["project"] : []),
         });
       } catch (err) {
         return fail(err);

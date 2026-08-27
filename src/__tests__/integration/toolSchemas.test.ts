@@ -20,6 +20,7 @@ import { registerAccountTools } from "../../tools/accounts.js";
 import { registerTransactionTools } from "../../tools/transactions.js";
 import { registerExpenseTools } from "../../tools/expenses.js";
 import { registerMileageTools } from "../../tools/mileage.js";
+import { registerProjectTools } from "../../tools/projects.js";
 import { registerContactTools } from "../../tools/contacts.js";
 import { registerInvoiceTools } from "../../tools/invoices.js";
 import { registerBillTools } from "../../tools/bills.js";
@@ -37,10 +38,11 @@ const PARAMETERLESS = new Set([
 const REQUIRED_PARAMS: Record<string, string[]> = {
   freeagent_list_transactions: ["bankAccountId"],
   freeagent_explain_transaction: ["explanationId", "category", "fileUrl", "markExplained"],
-  freeagent_create_expense: ["vendor", "datedOn", "grossAmount", "description"],
-  freeagent_create_contact: ["organisationName", "firstName", "email"],
-  freeagent_create_invoice: ["contact", "datedOn", "items"],
-  freeagent_create_bill: ["contact", "reference", "datedOn", "dueOn", "items"],
+  freeagent_create_expense: ["vendor", "datedOn", "grossAmount", "description", "rebillType", "filePath", "ecStatus"],
+  freeagent_update_expense: ["expenseId", "rebillType", "filePath", "fileUrl"],
+  freeagent_create_contact: ["organisationName", "firstName", "email", "salesTaxRegistrationNumber"],
+  freeagent_create_invoice: ["contact", "datedOn", "items", "ecStatus", "placeOfSupply"],
+  freeagent_create_bill: ["contact", "reference", "datedOn", "dueOn", "items", "filePath", "fileUrl", "ecStatus"],
   freeagent_create_timeslip: ["project", "task", "datedOn", "hours"],
   freeagent_create_task: ["project", "name"],
   freeagent_get_invoice: ["invoiceId"],
@@ -48,7 +50,19 @@ const REQUIRED_PARAMS: Record<string, string[]> = {
   freeagent_delete_invoice: ["invoiceId"],
   freeagent_delete_bill: ["billId"],
   freeagent_delete_timeslip: ["timeslipId"],
-  freeagent_create_mileage_expense: ["datedOn", "description"],
+  freeagent_get_bill: ["billId"],
+  freeagent_update_bill: ["billId", "ecStatus", "items", "filePath"],
+  freeagent_update_invoice: ["invoiceId", "ecStatus", "items"],
+  freeagent_update_contact: ["contactId", "salesTaxRegistrationNumber", "status"],
+  freeagent_delete_contact: ["contactId", "confirm"],
+  freeagent_create_project: ["contact", "name", "budgetUnits", "status"],
+  freeagent_update_project: ["projectId", "name", "status"],
+  freeagent_delete_project: ["projectId", "confirm"],
+  freeagent_update_task: ["taskId", "name", "status"],
+  freeagent_delete_task: ["taskId"],
+  freeagent_update_timeslip: ["timeslipId", "hours", "task"],
+  freeagent_delete_expense: ["expenseId", "confirm"],
+  freeagent_create_mileage_expense: ["datedOn", "description", "rebillType", "engineType", "haveVatReceipt"],
 };
 
 let tools: Array<{ name: string; inputSchema?: unknown }> = [];
@@ -59,6 +73,7 @@ beforeAll(async () => {
   registerTransactionTools(server);
   registerExpenseTools(server);
   registerMileageTools(server);
+  registerProjectTools(server);
   registerContactTools(server);
   registerInvoiceTools(server);
   registerBillTools(server);
@@ -111,5 +126,41 @@ describe("advertised tool schemas", () => {
       const schema = (tool.inputSchema ?? {}) as { type?: string };
       expect(schema.type, `${tool.name}`).toBe("object");
     }
+  });
+});
+
+/**
+ * A field the service supports but the schema never advertises is unreachable:
+ * a client reads the schema, does not see it, and never sends it.
+ */
+describe("nested line-item schemas advertise their fields", () => {
+  function lineProps(toolName: string) {
+    const tool = tools.find((t) => t.name === toolName);
+    const schema = tool!.inputSchema as {
+      properties?: { items?: { items?: { properties?: Record<string, unknown> } } };
+    };
+    return Object.keys(schema.properties?.items?.items?.properties ?? {});
+  }
+
+  it("exposes the bill line fields the service builds", () => {
+    expect(lineProps("freeagent_create_bill")).toEqual(
+      expect.arrayContaining(["salesTaxStatus", "quantity", "unit"])
+    );
+  });
+
+  it("exposes itemUrl and destroy on the update tools, which address existing lines", () => {
+    expect(lineProps("freeagent_update_bill")).toEqual(
+      expect.arrayContaining(["itemUrl", "destroy"])
+    );
+    expect(lineProps("freeagent_update_invoice")).toEqual(
+      expect.arrayContaining(["itemUrl", "destroy"])
+    );
+  });
+
+  it("registers a reader for every record whose lines can be edited", () => {
+    // Editing a line needs its URL, and only the detail readers return one.
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("freeagent_get_bill");
+    expect(names).toContain("freeagent_get_invoice");
   });
 });
