@@ -38,7 +38,7 @@
   "author": "Oxygen Bubbles Limited",
   "repository": {
     "type": "git",
-    "url": "https://github.com/OxygenBubbles/freeagent-mcp-server.git"
+    "url": "git+https://github.com/OxygenBubbles/freeagent-mcp-server.git"
   },
   "homepage": "https://github.com/OxygenBubbles/freeagent-mcp-server#readme",
   "files": [
